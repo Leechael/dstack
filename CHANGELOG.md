@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - TBD
+
+> [!IMPORTANT]
+> dstack 0.6.0 is the first monorepo release. Guest OS releases now use the
+> `guest-os-v0.6.0` tag in `Dstack-TEE/dstack`. Releases before 0.6.0 remain
+> archived in `Dstack-TEE/meta-dstack`.
+>
+> **0.5.10 and 0.5.11 were yanked.** Those releases are withdrawn. Their notes
+> are recorded again below, under those versions, so the changes are not lost
+> with the yanked releases. 0.6.0 follows v0.5.11 in git history.
+
+### Highlights
+
+- unified attestation for Intel TDX, AMD SEV-SNP, AWS Nitro Enclaves, GCP Confidential VMs, and development simulators, with canonical event log v2 and manifest-based OS and workload policy verification
+- a versioned guest-agent API. The unversioned surface is frozen at exactly v0.5.11, and new capability is `dstack.guest.v1`. v1 derives different key material than v0 for the same inputs
+- VMM-managed networking (netd, macvtap, libvirt network filters) and simultaneous registration of one CVM with multiple Gateway clusters (#1060)
+- local key providers, an external attestation root CA, and dm-verity volumes
+- shared authentication across the VMM, Gateway, and KMS administrative APIs (#796)
+- WaveKV v2, opt-in `dns-persist-01` certificate issuance, application health polling, and data-disk discard
+- the dstack runtime and guest OS sources live in this repository (#770)
+
 ### Added
 - sdk: every SDK ships two clients, one per guest-agent surface, and nothing else. `DstackClientV0` speaks the frozen v0.5.11 API on the unversioned paths -- every method a v0.5.x SDK had, including `verify()` (which calls the server `Verify` RPC) and `emit_event()` (which surfaces the agent's removal error verbatim). `DstackClientV1` speaks `dstack.guest.v1` at `/v1` and has exactly its six methods: `issue_cert`, `get_key`, `attest`, `attest_gpu`, `info`, `version`. They are transport mirrors, not a compatibility layer: neither translates a call to the other, and each one's method set is its surface's method set. **v1 derives different key material than v0 for the same inputs** -- see `docs/guest-api-v1.md` for the migration. `TappdClient` is untouched.
 
@@ -36,7 +57,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - guest-agent: container health also covers the `nerdctl-compose` runner, read through `nerdctl inspect` (its output is Docker-compatible). Requires nerdctl >= 2.3.1 for Compose `healthcheck:` to be honoured; the mkosi backend is pinned to 2.3.5
 - http-client: a caller can bound the response body (`http_request_bounded`, `PrpcClient::with_max_response_bytes`). Nothing is bounded by default — `dstack vmm logs --lines 100000` is a legitimate multi-megabyte fetch — but every client that talks to a guest agent opts in, in the gateway and in the VMM, because a CVM is untrusted and one of them polls on a timer against the whole fleet
 
+#### Attestation and platform support
+
+- AMD SEV-SNP image conversion, measurement, verification, and simulator support (#703)
+- AWS Nitro Enclave attestation and simulator support (#753)
+- GCP instance identity binding and unified OS image hash verification (#726, #757)
+- native TEE interfaces and a common TEE variant API (#743, #808)
+- unified Intel TDX measurement and attestation handling, including ACPI measurement (#742, #762, #769)
+- manifest-versioned OS policy, launch token, and GPU verification requirements (#754, #763, #765)
+- canonical JSON event log v2 with stricter event integrity validation (#646, #879, #1038)
+- external attestation root CA support (#806)
+- seeded and deterministic simulator attestation for reproducible tests (#964)
+- ACPI measurement and diagnosis in Rust, including DSDT generation for lite TDX images (#943, #1048, #1051, #1052, #1053)
+
+#### VMM, networking, storage, and guest OS
+
+- VMM networking RPCs for preparing and managing guest networking (#756)
+- a netd-based macvtap networking backend with systemd socket activation (#1061, #1068, #1069)
+- libvirt network filters and guest netfilter support (#837, #1042)
+- validation and restriction of requested guest networking modes (#1068)
+- a CVM can hold simultaneous WireGuard connections to more than one Gateway cluster, for failover across independently operated clusters (#1060)
+- local key provider support (#788)
+- development TDX and software TPM environments (#780, #798)
+- TSM provider configuration through environment variables (#782)
+- release discovery API for `dstackup` (#805)
+- array-form `init_script` support (#975)
+- image backend provenance tracking (#1073)
+- integrity-protected dm-verity volumes (#752)
+- production and development OS image flavors
+- experimental mkosi-based OS image builds with Docker caching and parallel SquashFS generation (#816, #828, #833, #834)
+- SELinux policy parity for guest services (#1043)
+- reproducible NVIDIA attestation tooling and improved GPU certificate verification (#789, #791, #813)
+- `/etc/os-release` and release artifacts identify dstack 0.6.0 (#1076)
+
+#### Gateway and tooling
+
+- WaveKV v2 with dual-stack compatibility and deterministic conflict resolution (#1031, #1067)
+- Gateway Prometheus metrics endpoint (#1037)
+- administrative recovery APIs (#1046)
+- DNS-based application address resolution (#921)
+- Certbot DNS API endpoint (#925)
+- API parity for the JavaScript and Python SDKs (#690, #695)
+- tag-driven release workflows for the Rust, JavaScript, Python, and Go SDKs (#686, #691, #692)
+- Rust SDK releases decoupled from the main workspace (#785)
+- `dstack-util decrypt` for decrypting protected payloads (#1054)
+- measured boot and attestation diagnostics (#943)
+
 ### Fixed
+- install: `dstack/scripts/install.sh` no longer lets git's own stdout leak into the checkout path. `resolve_source` returns that path on stdout, and `git checkout` / `git pull` also write there (the branch-tracking line, the fast-forward summary), so `$checkout` became a multi-line string and the following `cd` failed, including on the default `curl | sh` path where `--ref` is `next`. The git subshells and clones now discard stdout as a whole, and `info` / `error` use `printf` so a leading `-` is not swallowed
+- os/mkosi: the image ships the xmlsec1 OpenSSL runtime nvattest links against (`libxmlsec1t64` and `libxmlsec1t64-openssl` on Debian trixie). Only `libxmlsec1-dev` was listed under build packages, so every GPU CVM died during guest preparation with `libxmlsec1-openssl.so.1` missing and rebooted in a loop. There is no separate GPU profile in 0.6.0, so the runtime libraries belong in the main package list
 - data disks: discard now propagates through ZFS or ext4, dm-crypt, virtio-blk, and QEMU so encrypted qcow2 images release deleted blocks instead of growing with lifetime writes. Discard defaults on and can be disabled with `storage_discard: false` when allocation-pattern leakage is unacceptable; upgrading an existing ZFS pool also starts a one-time trim for historical free space
 - certbot: a certificate covering both a name and its wildcard (`example.com` and `*.example.com`) could never be issued over dns-01. The two authorizations are answered under one `_acme-challenge.example.com`, each with its own TXT value, and the publish step cleared every TXT record at that name before writing its own -- so the second authorization deleted the record answering the first, and the order failed with `Correct value not found for DNS challenge`. Clearing leftovers from an aborted run is now done once per challenge name per issuance, and the records for one name accumulate instead of replacing each other; cleanup afterwards is unchanged, deleting each record this run created by id
 - certbot: editing `domains` in `certbot.toml` had no effect once a certificate existed. Issuance was skipped whenever `live/cert.pem` was present, whatever names it carried, and renewal read its name list back off that certificate rather than the configuration -- so an added or removed name never reached the CA, and the mismatch survived every renewal. The live certificate's DNS names are now compared against the configured list (as sets, case- and trailing-dot-insensitive) and a mismatch reissues, logging both lists. A reissue that fails does not take the renewal check down with it: a name the CA will not validate is reported on every cycle, while the certificate actually being served keeps renewing, and the failure is still what the run returns unless the renewal committed something of its own
@@ -86,13 +155,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - sdk: the v0 clients are deprecated in the way each language's tooling understands, not only in prose. Rust's `DstackClientV0` and `TappdClient` carry `#[deprecated(since = "0.6.0")]`, so a downstream build warns at every mention of the type — the `use`, the constructor, any signature naming it. Method calls on an already-built client stay silent, because Rust does not propagate the attribute to inherent methods. Python's `DstackClientV0` and `AsyncDstackClientV0` emit a `DeprecationWarning` on construction, through the same helper `TappdClient` already used, alongside the `.. deprecated:: 0.6.0` docstring note they already carried. JavaScript's `DstackClientV0` already had its `@deprecated` JSDoc and `TappdClient` gains one. Go's `// Deprecated:` markers were in place but seven sat mid-comment rather than as their own trailing paragraph, which is the only form gopls and pkg.go.dev recognise, and are repaired.
 
   Nothing is removed and the wire behaviour is unchanged, but Python's marker is a runtime warning rather than a build-time one: a downstream test suite that turns `DeprecationWarning` into an error (`filterwarnings = error`, which is a common setting) will fail on `DstackClientV0()` until it adds a filter. The frozen surface stays reachable under its explicit name; it just says what it is now
-
+- repository: the former dstack and guest OS trees are one monorepo (#770). The default development branch is `next` (#1025, #1026)
+- kms: administrative APIs moved to a dedicated administration listener (#802)
+- kms: an application id can be derived without the KMS being reachable (#714)
+- gateway and kms: endpoint lists fail over across nodes, and Gateway and KMS administration use the shared API authentication (#796, #804)
+- attestation: event serialization is canonical and named, with stricter validation, and platform-specific attestation paths sit behind common verification and policy interfaces
+- os: release artifacts carry an explicit release identity and the image backend they were built with
 
 ### Removed
 - sdk: `TlsKeyOptions.path` in the JavaScript SDK. `GetTlsKeyArgs` has no such field and `getTlsKey` never read it, so a caller who set it was silently ignored. Breaking at the type level only, and only for code whose value was already being discarded. `deriveKey`'s `path` is a real, deprecated Tappd-era parameter and stays; the Python, Rust and Go v0 TLS-key options never carried one
 - guest-agent: the `EmitEvent` RPC no longer records anything -- runtime RTMR3 events are system-owned in 0.6.0, so an app can no longer extend the measurement chain. The method itself stays on the unversioned path and always fails with an error naming the removal, rather than being deleted outright: a deleted method answers HTTP 404 `Service not found: EmitEvent`, which tells a 0.5.x caller nothing about why its events stopped being recorded, while the kept stub fails with a message naming the removal and pointing at `report_data`. **Breaking:** any app extending RTMR3 at runtime must stop; bind app data through `report_data` instead, which is what most callers wanted anyway
 - gateway: `core.debug.insecure_skip_attestation`. It turned off both checks that make a gateway cluster a trust boundary: the node stopped asking its guest agent for its own app id, and every WaveKV sync and push, plus `ensure_from_gateway`, stopped checking the peer's. With it set, anything that could reach the sync routes could insert entries that replicated to every gateway in the cluster. It existed only because the integration suites could not run without it; they now run against a guest agent simulator and verify quotes through the production path, so nothing sets it. `docs/security/security-model.md` argues dstack's development switches are acceptable because they are visible in attestation measurements or public contract state -- that argument cannot cover the switch deciding whether attestation happens at all, which is why this one is deleted rather than documented. There is no replacement. **Breaking:** the config struct does not use `deny_unknown_fields`, so a leftover line is ignored rather than rejected, and what follows depends on why it was set. On a TDX host with a guest agent the gateway starts normally and peers that cannot present a verifiable app id stop being accepted. On a host with no guest agent -- the usual reason to have set it -- the gateway no longer starts at all, failing with `Failed to get app info`, because `my_app_id` is what every peer check compares against and a node that cannot learn its own identity must not come up without one. Remove the line and make sure every node can attest
+- vmm: legacy port-forward management, replaced by VMM-managed networking (#795)
+- gateway: the legacy debug key (#999)
+- attestation: obsolete SEV text digest handling (#764)
 
+### Security
+
+- LUKS2 keyslot bounds checking, and storage keys are no longer passed through process arguments (#799, #886)
+- restrictive permissions and atomic updates for KMS, guest, Gateway, certificate, attestation, and TPM key material
+- archive extraction, image artifacts, console logs, registry layers, and filesystem paths are confined
+- RA-TLS validation checks certificate and key matching, security profiles, and application extensions, and rejects unattested certificates
+- KMS node authorization, finalized Ethereum authentication, policy auditing, endpoint redaction, and bootstrap behavior
+- stricter quote size, report-data, trailing-byte, event ordering, and event-preimage validation
+- WireGuard public key validation and Gateway registration collision handling
+
+## [0.5.11] - 2026-05-26
+
+**Yanked.** This release was withdrawn. The notes are repeated here so they are not lost with it.
+
+### Changed
+
+- dstack-mr: a `Stable202505` arm covers the 17-event RTMR[0] chain produced by `edk2-stable202505` OVMF. Most events are derived from first principles (fw_cfg `BootMenu` / `bootorder` blobs, `BootOrder` / `Boot0000` / `Boot0001` UEFI variables) instead of hardcoded digests. `extract_version_from_image_name` accepts an optional non-numeric suffix, so an image name like `dstack-0.5.10.rc1` still resolves to a variant (#678)
+- verifier: `MEASUREMENT_CACHE_VERSION` is bumped so verifiers drop any RTMR0 cached with the incomplete Stable202505 model
+
+### Fixed
+
+- RA-TLS certificates: IP `subjectAltName` entries
+- `key-provider-build`: pin transitive dependencies so `mr_enclave` is reproducible
+- KMS onboarding page: PPID display, site name, chain info, and k256 public key on the onboard view; configurable auth-mock policies; an extra Ethereum RPC URL field on `auth-eth-bun /info`
+
+### Security
+
+- dependency bumps for Hono and fast-uri across `kms/auth-*`
+
+> Known issue, carried by this yanked release: the `EV_EFI_HANDOFF_TABLES` event added by `SmbiosMeasurementDxe` in stable202505 hashes the filtered QEMU SMBIOS table, whose Type 16/17/19 contents scale with memory size, CPU, and SMBIOS type 1 overrides. The digest captured in #678 matches a single 2 GB CVM and fails for any other memory size. Mitigated in the OVMF layer by pinning OVMF to `edk2-stable202502`, the newest stable tag that predates that driver ([meta-dstack#63](https://github.com/Dstack-TEE/meta-dstack/pull/63)).
+
+## [0.5.10] - 2026-05-08
+
+**Yanked.** This release was withdrawn. The notes are repeated here so they are not lost with it.
+
+### Added
+
+- KMS: Prometheus metrics endpoint, enabled by default (#657)
+
+### Changed
+
+- VMM: ISO rootfs is disallowed for modern images (#663)
+- SDK: drop `hickory-dns` from reqwest features (#659)
+- workspace version and lockfile bumped to 0.5.10
+
+### Security
+
+- CI: Docker build checks on fork PRs use the fork `clone_url` (#654), and rust-toolchain action refs are pinned (#661)
+- dependencies: bump `tar`, `axios`, `fast-xml-parser`, and `@aws-sdk/xml-builder` (#592, #660, #662)
 
 ## [0.5.5] - 2025-10-20
 
@@ -1359,7 +1485,10 @@ New contributors in this release:
 * @Leechael made their first contribution
 * @nanometerzhu made their first contribution
 * @h4x3rotab made their first contribution
-[unreleased]: https://github.com/Dstack-TEE/dstack/compare/v0.5.5..HEAD
+[unreleased]: https://github.com/Dstack-TEE/dstack/compare/v0.6.0..HEAD
+[0.6.0]: https://github.com/Dstack-TEE/dstack/compare/v0.5.11..v0.6.0
+[0.5.11]: https://github.com/Dstack-TEE/dstack/compare/v0.5.10..v0.5.11
+[0.5.10]: https://github.com/Dstack-TEE/dstack/compare/v0.5.9..v0.5.10
 [0.5.5]: https://github.com/Dstack-TEE/dstack/compare/v0.5.4..v0.5.5
 [0.5.4]: https://github.com/Dstack-TEE/dstack/compare/v0.5.3..v0.5.4
 [0.5.3]: https://github.com/Dstack-TEE/dstack/compare/v0.5.2..v0.5.3
