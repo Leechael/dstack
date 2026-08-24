@@ -31,6 +31,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    time::Duration,
 };
 use supervisor_client::supervisor::ProcessConfig;
 
@@ -252,10 +253,14 @@ impl PreparedQemuLaunch {
         prepare_shared_disk(&workdir, cfg)?;
 
         let tee_enabled = !vm.manifest.no_tee;
+        // Pool VMs are claimed with a per-app compose only after the TD is
+        // built, so the compose binding baked into MRCONFIGID cannot be known
+        // at launch. RTMR3 + KMS still constrain the claimed compose.
         let tdx_mr_config_id = if tee_enabled
             && platform == CvmPlatform::Tdx
             && cfg.use_mrconfigid
             && vm.image.info.version_tuple().unwrap_or_default() >= (0, 5, 2)
+            && !vm.manifest.pool
         {
             Some(tdx_mr_config_id(&workdir, &app_compose)?)
         } else {
@@ -494,11 +499,15 @@ impl QemuCommandBuilder<'_> {
             workdir.serial_file().display()
         ));
         command.arg("-serial").arg("chardev:com0");
-        if self.cfg.qmp_socket {
+        if self.cfg.qmp_socket || self.vm.manifest.paused || self.vm.manifest.pool {
             command.arg("-qmp").arg(format!(
                 "unix:{},server,wait=off",
                 workdir.qmp_socket().display()
             ));
+        }
+        if self.vm.manifest.paused {
+            // Hold the guest at reset; StartVm resumes it via QMP `cont`.
+            command.arg("-S");
         }
         if let Some(bios) = self.vm.image.firmware(self.is_amd_sev_snp()) {
             command.arg("-bios").arg(bios);
@@ -1013,6 +1022,88 @@ fn find_numa(device: Option<String>) -> Result<(String, String)> {
     Ok((numa_node, cpus))
 }
 
+/// Execute QMP commands over the VM unix monitor socket, returning responses.
+pub(crate) fn qmp_execute(socket: &Path, commands: &[&str]) -> Result<Vec<serde_json::Value>> {
+    use std::io::{BufRead, BufReader};
+    let stream = std::os::unix::net::UnixStream::connect(socket)
+        .with_context(|| format!("failed to connect to QMP socket {}", socket.display()))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .context("failed to set QMP read timeout")?;
+    let mut writer = stream.try_clone().context("failed to clone QMP stream")?;
+    let mut reader = BufReader::new(stream);
+    fn read_response(
+        reader: &mut BufReader<std::os::unix::net::UnixStream>,
+    ) -> Result<serde_json::Value> {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = reader
+                .read_line(&mut line)
+                .context("failed to read QMP message")?;
+            if n == 0 {
+                bail!("QMP connection closed");
+            }
+            let value: serde_json::Value =
+                serde_json::from_str(line.trim()).context("invalid QMP JSON")?;
+            if value.get("event").is_some() {
+                continue;
+            }
+            return Ok(value);
+        }
+    }
+    read_response(&mut reader).context("failed to read QMP greeting")?;
+    writer
+        .write_all(b"{\"execute\":\"qmp_capabilities\"}\r\n")
+        .context("failed to send qmp_capabilities")?;
+    let resp = read_response(&mut reader)?;
+    if let Some(error) = resp.get("error") {
+        bail!("qmp_capabilities failed: {error}");
+    }
+    let mut responses = Vec::new();
+    for command in commands {
+        writer
+            .write_all(command.as_bytes())
+            .and_then(|()| writer.write_all(b"\r\n"))
+            .with_context(|| format!("failed to send QMP command {command}"))?;
+        let resp = read_response(&mut reader)?;
+        if let Some(error) = resp.get("error") {
+            bail!("QMP command {command} failed: {error}");
+        }
+        responses.push(resp);
+    }
+    Ok(responses)
+}
+
+/// Query the QMP runstate (e.g. "prelaunch", "paused", "running").
+pub(crate) fn qmp_query_status(socket: &Path) -> Result<String> {
+    let responses = qmp_execute(socket, &[r#"{"execute":"query-status"}"#])?;
+    let status = responses[0]
+        .get("return")
+        .and_then(|ret| ret.get("status"))
+        .and_then(|status| status.as_str())
+        .context("QMP query-status returned no status")?;
+    Ok(status.to_string())
+}
+
+/// Ask the guest OS to shut down via QMP `system_powerdown` (ACPI).
+pub(crate) fn qmp_system_powerdown(socket: &Path) -> Result<()> {
+    qmp_execute(socket, &[r#"{"execute":"system_powerdown"}"#])?;
+    Ok(())
+}
+
+/// Pause a running guest via QMP `stop`.
+pub(crate) fn qmp_stop(socket: &Path) -> Result<()> {
+    qmp_execute(socket, &[r#"{"execute":"stop"}"#])?;
+    Ok(())
+}
+
+/// Resume a paused guest via QMP `cont`.
+pub(crate) fn qmp_cont(socket: &Path) -> Result<()> {
+    qmp_execute(socket, &[r#"{"execute":"cont"}"#])?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -1120,6 +1211,9 @@ mod tests {
                 volumes: vec![VmVolume {
                     source: "/does-not-exist/volume.img".into(),
                 }],
+                paused: false,
+                pool: false,
+                runtime_id: None,
             },
             image: Image {
                 info: ImageInfo {

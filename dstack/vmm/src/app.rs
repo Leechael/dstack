@@ -128,9 +128,25 @@ pub struct Manifest {
     pub networks: Vec<Networking>,
     #[serde(default)]
     pub volumes: Vec<VmVolume>,
+    /// Launch QEMU with -S and hold the guest at reset until StartVm resumes
+    /// it via QMP `cont`. Cleared once the VM has been resumed.
+    #[serde(default)]
+    pub paused: bool,
+    /// Warm-pool member: do not write shared/.pool-release so the guest waits
+    /// at the pool barrier until a claim provisions the real config.
+    #[serde(default)]
+    pub pool: bool,
+    /// Supervisor/QEMU process ID backing this logical VM. Set after a stopped
+    /// logical VM claims a half-booted pool member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<String>,
 }
 
 impl Manifest {
+    pub fn runtime_id(&self) -> &str {
+        self.runtime_id.as_deref().unwrap_or(&self.id)
+    }
+
     pub fn from_json(value: serde_json::Value) -> serde_json::Result<Self> {
         let mut map = value;
         if let Some(obj) = map.as_object_mut() {
@@ -395,6 +411,40 @@ impl App {
         Ok(())
     }
 
+    fn spawn_pause_pool_at_barrier(&self, id: String, work_dir: VmWorkDir) {
+        let app = self.clone();
+        tokio::spawn(async move {
+            for _ in 0..3000 {
+                let reached = fs::read_to_string(work_dir.serial_file())
+                    .map(|serial| serial.contains("pool barrier: .pool-release missing"))
+                    .unwrap_or(false);
+                if reached {
+                    let socket = work_dir.qmp_socket();
+                    let result =
+                        tokio::task::spawn_blocking(move || crate::app::qemu::qmp_stop(&socket))
+                            .await;
+                    match result {
+                        Ok(Ok(())) => {
+                            if let Err(err) = fs::write(work_dir.join(".pool-ready"), b"1\n") {
+                                warn!("failed to mark pool VM {id} ready: {err:?}");
+                            } else {
+                                info!("pool VM {id} reached claim barrier and was paused");
+                            }
+                        }
+                        Ok(Err(err)) => warn!("failed to pause pool VM {id}: {err:?}"),
+                        Err(err) => warn!("pool pause task failed for {id}: {err:?}"),
+                    }
+                    return;
+                }
+                if app.supervisor.info(&id).await.ok().flatten().is_none() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            warn!("pool VM {id} did not reach claim barrier before timeout");
+        });
+    }
+
     pub async fn start_vm(&self, id: &str) -> Result<()> {
         self.start_vm_with_restart_policy(id, true).await
     }
@@ -435,6 +485,7 @@ impl App {
             }
             vm_state.config.clone()
         };
+        let should_pause_pool = !is_running && vm_config.manifest.pool;
         if !is_running {
             let work_dir = self.work_dir(id)?;
             for path in [work_dir.serial_pty(), work_dir.qmp_socket()] {
@@ -519,6 +570,34 @@ impl App {
             let mut state = self.lock();
             let vm_state = state.get_mut(id).context("VM not found")?;
             vm_state.state.devices = devices;
+        } else if vm_config.manifest.paused {
+            let qmp_socket = self.work_dir(id)?.qmp_socket();
+            let socket = qmp_socket.clone();
+            let runstate =
+                tokio::task::spawn_blocking(move || crate::app::qemu::qmp_query_status(&socket))
+                    .await
+                    .context("QMP query-status task failed")??;
+            if matches!(runstate.as_str(), "prelaunch" | "paused") {
+                let socket = qmp_socket.clone();
+                tokio::task::spawn_blocking(move || crate::app::qemu::qmp_cont(&socket))
+                    .await
+                    .context("QMP cont task failed")??;
+                info!("resumed paused VM {id} via QMP cont (was {runstate})");
+                let mut manifest = vm_config.manifest.clone();
+                manifest.paused = false;
+                if let Err(err) = self.work_dir(id)?.put_manifest(&manifest) {
+                    warn!("failed to clear paused flag for {id}: {err:?}");
+                }
+                let mut state = self.lock();
+                if let Some(vm_state) = state.get_mut(id) {
+                    vm_state.state.start(false);
+                }
+            } else {
+                info!("VM {id} already in runstate {runstate}, nothing to resume");
+            }
+        }
+        if should_pause_pool {
+            self.spawn_pause_pool_at_barrier(id.to_string(), self.work_dir(id)?);
         }
         Ok(())
     }
@@ -1288,6 +1367,16 @@ impl App {
                 serde_json::to_string(&instance_info)?,
             )
             .context("Failed to write vm config")?;
+        }
+        // Warm-pool barrier flag: non-pool VMs carry the release flag from the
+        // start; pool VMs only get it when claimed.
+        let pool_release = shared_dir.join(".pool-release");
+        if req.pool {
+            if pool_release.exists() {
+                fs::remove_file(&pool_release).context("Failed to clear .pool-release")?;
+            }
+        } else {
+            fs::write(&pool_release, b"1\n").context("Failed to write .pool-release")?;
         }
         Ok(work_dir)
     }
@@ -2363,6 +2452,9 @@ mod tests {
             swtpm: false,
             networks: vec![],
             volumes: vec![],
+            paused: false,
+            pool: false,
+            runtime_id: None,
         }
     }
 
@@ -2719,6 +2811,9 @@ mod tests {
             swtpm: false,
             networks: vec![],
             volumes: vec![],
+            paused: false,
+            pool: false,
+            runtime_id: None,
         };
 
         let mr_config = MrConfigV3::new(

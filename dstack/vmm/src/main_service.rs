@@ -270,6 +270,9 @@ pub fn create_manifest_from_vm_config(
         swtpm,
         networks: networks_from_vm_config(&request, cvm_config)?,
         volumes,
+        paused: request.paused,
+        pool: request.pool,
+        runtime_id: None,
     })
 }
 
