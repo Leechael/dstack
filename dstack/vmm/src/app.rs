@@ -702,6 +702,11 @@ impl App {
     }
 
     async fn prebind_restart_standby(&self, id: &str) -> Result<()> {
+        {
+            let runtime_id = self.runtime_id(id);
+            let work_dir = self.active_work_dir(id)?;
+            self.wait_vm_process_gone(&runtime_id, &work_dir).await?;
+        }
         let claimed = self.claim_pool_for(id, true).await;
         let claimed = match claimed {
             Ok(claimed) => claimed,
@@ -770,13 +775,14 @@ impl App {
         if !work_dir.join(".pool-app-paused").exists() {
             return Ok(false);
         }
+        let qmp_socket = work_dir.qmp_socket();
+        let socket = qmp_socket.clone();
+        tokio::task::spawn_blocking(move || crate::app::qemu::qmp_cont(&socket))
+            .await
+            .context("QMP cont task failed")??;
         fs::write(work_dir.shared_dir().join(".pool-app-release"), b"1\n")
             .context("Failed to release standby app barrier")?;
         let _ = fs::remove_file(work_dir.join(".pool-app-paused"));
-        let qmp_socket = work_dir.qmp_socket();
-        tokio::task::spawn_blocking(move || crate::app::qemu::qmp_cont(&qmp_socket))
-            .await
-            .context("QMP cont task failed")??;
         work_dir.set_started(true)?;
         {
             let mut state = self.lock();
@@ -959,6 +965,41 @@ impl App {
             .context("Failed to set started")
     }
 
+    /// Wait until the QEMU process is really gone: Supervisor says it is not
+    /// running and `qemu.pid` is removed. A dead QEMU leaves the pid file
+    /// behind, so only a removed file (or a reused pid that is not this
+    /// workdir's QEMU) counts as gone.
+    async fn wait_vm_process_gone(&self, runtime_id: &str, work_dir: &VmWorkDir) -> Result<()> {
+        let pid_file = work_dir.path().join("qemu.pid");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let running = self
+                .supervisor
+                .info(runtime_id)
+                .await?
+                .is_some_and(|info| info.state.status.is_running());
+            if !running && !pid_file.exists() {
+                return Ok(());
+            }
+            if !running && pid_file.exists() {
+                // Supervisor already reaped the process; a stale pid file should
+                // not block prebind forever.
+                let still_ours = fs::read_to_string(&pid_file)
+                    .ok()
+                    .and_then(|body| body.trim().parse::<i32>().ok())
+                    .map(|pid| unsafe { libc::kill(pid, 0) } == 0)
+                    .unwrap_or(false);
+                if !still_ours {
+                    return Ok(());
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                bail!("VM {runtime_id} process did not exit in time");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
     pub async fn stop_vm(&self, id: &str) -> Result<()> {
         if let Some(vm) = self.lock().get_mut(id) {
             vm.state.auto_restart.reset();
@@ -1002,7 +1043,7 @@ impl App {
                         break;
                     }
                     if std::time::Instant::now() >= deadline {
-                        warn!("VM {id} ignored QMP powerdown for 20s, forcing stop");
+                        warn!("VM {id} ignored QMP powerdown for 8s, forcing stop");
                         break;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -1012,18 +1053,19 @@ impl App {
         self.stop_vm_process(&runtime_id).await?;
         let networks = work_dir.runtime_networks();
         self.remove_filtered_networks(id, &networks).await?;
-        let should_prebind = {
-            let mut state = self.lock();
-            let eligible = state
+        let eligible = {
+            let state = self.lock();
+            state
                 .get(id)
                 .map(|vm| !vm.state.removing && !vm.config.manifest.pool)
-                .unwrap_or(false);
-            if eligible {
-                state.prebinding.insert(id.to_string());
-            }
-            eligible
+                .unwrap_or(false)
         };
-        if should_prebind {
+        if eligible {
+            if let Err(err) = self.wait_vm_process_gone(&runtime_id, &work_dir).await {
+                warn!(id, "skip standby prebind: {err:#}");
+                return Ok(());
+            }
+            self.lock().prebinding.insert(id.to_string());
             let app = self.clone();
             let id = id.to_string();
             tokio::spawn(async move {

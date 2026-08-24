@@ -132,10 +132,21 @@ start)
         source <(jq -r '.pre_launch_script' "$APP_COMPOSE_FILE")
     fi
 
-    # Pool standby barrier: a pre-bound standby runs everything up to here
-    # (keys, disk, env, container runtimes, pre-launch), then holds until the
-    # user's StartVm releases the app.
+    # Keep the standby checkpoint self-contained: a resumed StartVm should
+    # only create containers, never re-run housekeeping that already ran while
+    # the VM was being parked.
     if [ -e /tmp/.host-shared/.pool-standby ] && [ ! -e /tmp/.host-shared/.pool-app-release ]; then
+        case "$runner" in
+        docker-compose)
+            echo "Pruning unused Docker images and volumes before standby"
+            docker image prune -af
+            docker volume prune -f
+            ;;
+        nerdctl-compose)
+            echo "Pruning unused containerd images before standby"
+            nerdctl --namespace "$NERDCTL_NAMESPACE" --snapshotter "$snapshotter" image prune -af
+            ;;
+        esac
         echo "pool app barrier: standby ready, waiting for start"
         dstack-util notify-host -e "boot.progress" -d "pool standby" || true
         APP_WAIT=0
@@ -157,13 +168,15 @@ start)
             dstack-util notify-host -e "boot.error" -d "failed to start containers"
             exit 1
         fi
-        if [ "$runner" = docker-compose ]; then
-            echo "Pruning unused Docker images and volumes"
-            docker image prune -af
-            docker volume prune -f
-        else
-            echo "Pruning unused containerd images"
-            nerdctl --namespace "$NERDCTL_NAMESPACE" --snapshotter "$snapshotter" image prune -af
+        if [ ! -e /tmp/.host-shared/.pool-app-release ]; then
+            if [ "$runner" = docker-compose ]; then
+                echo "Pruning unused Docker images and volumes"
+                docker image prune -af
+                docker volume prune -f
+            else
+                echo "Pruning unused containerd images"
+                nerdctl --namespace "$NERDCTL_NAMESPACE" --snapshotter "$snapshotter" image prune -af
+            fi
         fi
         ;;
     bash)
