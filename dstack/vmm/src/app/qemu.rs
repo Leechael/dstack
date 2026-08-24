@@ -366,14 +366,53 @@ impl PreparedQemuLaunch {
     }
 }
 
+fn create_pool_hd(image_file: &Path, size: &str) -> Result<()> {
+    let output = Command::new("qemu-img")
+        .args(["create", "-f", "raw"])
+        .arg(image_file)
+        .arg(size)
+        .output()
+        .context("Failed to create raw pool data disk")?;
+    if !output.status.success() {
+        bail!(
+            "Failed to create raw pool data disk: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let output = Command::new("sgdisk")
+        .args([
+            "-o",
+            "-n",
+            "1:1MiB:0",
+            "-c",
+            "1:dstack-data",
+            "-t",
+            "1:8300",
+        ])
+        .arg(image_file)
+        .output()
+        .context("Failed to partition raw pool data disk")?;
+    if !output.status.success() {
+        bail!(
+            "Failed to partition raw pool data disk: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
 fn prepare_data_disk(vm: &VmConfig, workdir: &VmWorkDir) -> Result<()> {
     let hda_path = workdir.hda_path();
     if !hda_path.exists() {
-        create_hd(
-            &hda_path,
-            vm.image.hda.as_ref(),
-            &format!("{}G", vm.manifest.disk_size),
-        )?;
+        if vm.manifest.pool {
+            create_pool_hd(&hda_path, &format!("{}G", vm.manifest.disk_size))?;
+        } else {
+            create_hd(
+                &hda_path,
+                vm.image.hda.as_ref(),
+                &format!("{}G", vm.manifest.disk_size),
+            )?;
+        }
     }
     Ok(())
 }
@@ -496,7 +535,7 @@ impl VmConfig {
         let executable =
             std::env::current_exe().context("failed to locate dstack-vmm executable")?;
         let launcher = ProcessConfig {
-            id: self.manifest.id.clone(),
+            id: self.manifest.runtime_id().to_string(),
             name: self.manifest.name.clone(),
             command: executable.to_string_lossy().into_owned(),
             args: vec![
@@ -636,12 +675,23 @@ impl QemuCommandBuilder<'_> {
     }
 
     fn configure_data_disk(&self, command: &mut Command) {
-        command
-            .arg("-drive")
-            .arg(format!(
+        // Pool VMs boot with the normal virtio-blk topology but a raw GPT-only
+        // placeholder. While QEMU is paused, claim overwrites that inode with
+        // the original encrypted disk (file.locking=off).
+        let data_drive = if self.vm.manifest.pool {
+            format!(
+                "file={},if=none,id=hd1,format=raw,file.locking=off",
+                self.prepared.workdir.hda_path().display()
+            )
+        } else {
+            format!(
                 "file={},if=none,id=hd1",
                 self.prepared.workdir.hda_path().display()
-            ))
+            )
+        };
+        command
+            .arg("-drive")
+            .arg(data_drive)
             .arg("-device")
             .arg(virtio_pci_device(
                 "virtio-blk-pci,drive=hd1",
@@ -678,7 +728,7 @@ impl QemuCommandBuilder<'_> {
         for (index, networking) in self.prepared.networks.iter().enumerate() {
             let net_id = format!("net{index}");
             let mac = mac_address_for_vm_index(
-                &self.vm.manifest.id,
+                self.vm.manifest.runtime_id(),
                 &networking.mac_prefix_bytes(),
                 index,
             );
@@ -909,7 +959,7 @@ impl QemuCommandBuilder<'_> {
             serial_logappend: true,
         })?;
         Ok(ProcessConfig {
-            id: self.vm.manifest.id.clone(),
+            id: self.vm.manifest.runtime_id().to_string(),
             args: arguments,
             name: self.vm.manifest.name.clone(),
             command,
@@ -1170,6 +1220,41 @@ pub(crate) fn qmp_stop(socket: &Path) -> Result<()> {
 /// Resume a paused guest via QMP `cont`.
 pub(crate) fn qmp_cont(socket: &Path) -> Result<()> {
     qmp_execute(socket, &[r#"{"execute":"cont"}"#])?;
+    Ok(())
+}
+
+/// Copy a stopped logical VM's encrypted disk into a pool VM's raw placeholder.
+/// The destination inode is already open by paused QEMU, so `-n` is required.
+pub(crate) fn replace_pool_data_disk(source: &Path, destination: &Path) -> Result<()> {
+    let info = Command::new("qemu-img")
+        .args(["info", "--output=json"])
+        .arg(source)
+        .output()
+        .context("Failed to inspect source data disk")?;
+    if !info.status.success() {
+        bail!(
+            "Failed to inspect source data disk: {}",
+            String::from_utf8_lossy(&info.stderr)
+        );
+    }
+    let info: serde_json::Value =
+        serde_json::from_slice(&info.stdout).context("Invalid qemu-img info output")?;
+    let format = info
+        .get("format")
+        .and_then(|value| value.as_str())
+        .context("qemu-img info did not report source format")?;
+    let output = Command::new("qemu-img")
+        .args(["convert", "-n", "-f", format, "-O", "raw"])
+        .arg(source)
+        .arg(destination)
+        .output()
+        .context("Failed to copy data disk into pool placeholder")?;
+    if !output.status.success() {
+        bail!(
+            "Failed to copy data disk into pool placeholder: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     Ok(())
 }
 

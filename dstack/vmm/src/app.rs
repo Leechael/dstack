@@ -333,6 +333,20 @@ impl App {
         Ok(VmWorkDir::new(self.config.run_path.join(id)))
     }
 
+    fn active_work_dir(&self, id: &str) -> Result<VmWorkDir> {
+        if let Some(vm) = self.lock().get(id) {
+            return Ok(VmWorkDir::new(&vm.config.workdir));
+        }
+        self.work_dir(id)
+    }
+
+    fn runtime_id(&self, id: &str) -> String {
+        self.lock()
+            .get(id)
+            .map(|vm| vm.config.manifest.runtime_id().to_string())
+            .unwrap_or_else(|| id.to_string())
+    }
+
     pub fn new(config: Config, supervisor: SupervisorClient) -> Self {
         let cid_start = config.cvm.cid_start;
         let cid_end = cid_start.saturating_add(config.cvm.cid_pool_size);
@@ -342,6 +356,7 @@ impl App {
             state: Arc::new(Mutex::new(AppState {
                 cid_pool,
                 vms: HashMap::new(),
+                prebinding: HashSet::new(),
             })),
             config: Arc::new(config),
             pull_status: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -368,8 +383,9 @@ impl App {
         let image_path = self.config.image.path.join(&manifest.image);
         let image = Image::load(&image_path).context("Failed to load image")?;
         let vm_id = manifest.id.clone();
+        let runtime_id = manifest.runtime_id().to_string();
         let mut runtime_networks = vm_work_dir.runtime_networks();
-        if runtime_networks.is_empty() && cids_assigned.contains_key(&vm_id) {
+        if runtime_networks.is_empty() && cids_assigned.contains_key(&runtime_id) {
             runtime_networks = resolved_networks(&manifest, &self.config.cvm);
             if let Err(err) = vm_work_dir.set_runtime_networks(&runtime_networks) {
                 warn!(id = %vm_id, "failed to persist inferred runtime networks: {err}");
@@ -383,7 +399,7 @@ impl App {
             let cid = states
                 .get(&vm_id)
                 .map(|vm| vm.config.cid)
-                .or_else(|| cids_assigned.get(&vm_id).cloned())
+                .or_else(|| cids_assigned.get(&runtime_id).cloned())
                 .or_else(|| states.cid_pool.allocate())
                 .context("CID pool exhausted")?;
             let vm_config = VmConfig {
@@ -445,7 +461,328 @@ impl App {
         });
     }
 
+    fn pool_compatible(target: &Manifest, pool: &Manifest) -> bool {
+        pool.pool
+            && target.image == pool.image
+            && target.vcpu == pool.vcpu
+            && target.memory == pool.memory
+            && target.disk_size == pool.disk_size
+            && target.hugepages == pool.hugepages
+            && target.pin_numa == pool.pin_numa
+            && target.no_tee == pool.no_tee
+            && serde_json::to_value(&target.networks).ok()
+                == serde_json::to_value(&pool.networks).ok()
+            && serde_json::to_value(&target.gpus).ok() == serde_json::to_value(&pool.gpus).ok()
+            && serde_json::to_value(&target.port_map).ok()
+                == serde_json::to_value(&pool.port_map).ok()
+    }
+
+    fn copy_claim_files(source: &VmWorkDir, destination: &VmWorkDir) -> Result<()> {
+        let source = source.shared_dir();
+        let destination = destination.shared_dir();
+        fs::create_dir_all(&destination).context("Failed to create pool shared directory")?;
+        for name in [
+            APP_COMPOSE,
+            ENCRYPTED_ENV,
+            USER_CONFIG,
+            INSTANCE_INFO,
+            SYS_CONFIG,
+        ] {
+            let dst = destination.join(name);
+            if dst.exists() {
+                fs::remove_file(&dst)
+                    .with_context(|| format!("Failed to clear {}", dst.display()))?;
+            }
+            let src = source.join(name);
+            if src.exists() {
+                fs::copy(&src, &dst).with_context(|| {
+                    format!("Failed to copy {} to {}", src.display(), dst.display())
+                })?;
+            }
+        }
+        for flag in [
+            ".pool-release",
+            ".pool-claimed",
+            ".pool-disk-ready",
+            ".pool-standby",
+            ".pool-app-release",
+        ] {
+            let flag = destination.join(flag);
+            if flag.exists() {
+                fs::remove_file(&flag)
+                    .with_context(|| format!("Failed to clear {}", flag.display()))?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn try_start_vm_from_pool(&self, id: &str) -> Result<bool> {
+        self.claim_pool_for(id, false).await
+    }
+
+    async fn claim_pool_for(&self, id: &str, standby: bool) -> Result<bool> {
+        let (target, candidates) = {
+            let state = self.lock();
+            let Some(target) = state.get(id).cloned() else {
+                bail!("VM not found");
+            };
+            if target.config.manifest.pool
+                || VmWorkDir::new(&target.config.workdir)
+                    .started()
+                    .unwrap_or(false)
+            {
+                return Ok(false);
+            }
+            let candidates = state
+                .iter_vms()
+                .filter(|vm| {
+                    vm.config.manifest.id != id
+                        && Self::pool_compatible(&target.config.manifest, &vm.config.manifest)
+                        && vm.config.workdir.join(".pool-ready").exists()
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            (target, candidates)
+        };
+
+        let target_runtime_id = target.config.manifest.runtime_id().to_string();
+        if self
+            .supervisor
+            .info(&target_runtime_id)
+            .await?
+            .is_some_and(|info| info.state.status.is_running())
+        {
+            return Ok(false);
+        }
+        if !target.config.workdir.join("hda.img").exists() {
+            return Ok(false);
+        }
+
+        let mut selected = None;
+        for candidate in candidates {
+            let runtime_id = candidate.config.manifest.runtime_id().to_string();
+            let running = self
+                .supervisor
+                .info(&runtime_id)
+                .await?
+                .is_some_and(|info| info.state.status.is_running());
+            if !running {
+                continue;
+            }
+            let socket = candidate.config.workdir.join("qmp.sock");
+            let runstate =
+                tokio::task::spawn_blocking(move || crate::app::qemu::qmp_query_status(&socket))
+                    .await
+                    .context("QMP query-status task failed")??;
+            if runstate == "paused" {
+                let ready = candidate.config.workdir.join(".pool-ready");
+                let claiming = candidate.config.workdir.join(".pool-claiming");
+                if fs::rename(&ready, &claiming).is_ok() {
+                    selected = Some(candidate);
+                    break;
+                }
+            }
+        }
+        let Some(pool) = selected else {
+            return Ok(false);
+        };
+
+        let pool_runtime_id = pool.config.manifest.runtime_id().to_string();
+        let target_work_dir = VmWorkDir::new(&target.config.workdir);
+        let pool_work_dir = VmWorkDir::new(&pool.config.workdir);
+        let source_disk = target_work_dir.hda_path();
+        let claimed_disk = pool_work_dir.hda_path();
+        if !claimed_disk.exists() {
+            bail!(
+                "pool VM {} has no raw data disk placeholder",
+                pool.config.manifest.id
+            );
+        }
+
+        Self::copy_claim_files(&target_work_dir, &pool_work_dir)?;
+        let mut manifest = target.config.manifest.clone();
+        manifest.runtime_id = Some(pool_runtime_id.clone());
+        manifest.pool = false;
+        manifest.paused = false;
+        pool_work_dir
+            .put_manifest(&manifest)
+            .context("Failed to persist claimed manifest")?;
+        self.sync_dynamic_config_for(&pool_work_dir, &manifest)?;
+
+        let image_path = self.config.image.path.join(&manifest.image);
+        let image = Image::load(&image_path).context("Failed to load claimed VM image")?;
+        let mut claimed_state = target.state.clone();
+        claimed_state.start(false);
+        claimed_state.devices = pool.state.devices.clone();
+        claimed_state.runtime_networks = pool.state.runtime_networks.clone();
+        let claimed_config = VmConfig {
+            manifest: manifest.clone(),
+            image,
+            cid: pool.config.cid,
+            workdir: pool.config.workdir.clone(),
+            gateway_enabled: target.config.gateway_enabled,
+        };
+        {
+            let mut state = self.lock();
+            let old = state
+                .remove(id)
+                .context("logical VM disappeared during pool claim")?;
+            let _ = state
+                .remove(&pool.config.manifest.id)
+                .context("pool VM disappeared during claim")?;
+            state.cid_pool.free(old.config.cid);
+            state.add(VmState {
+                config: Arc::new(claimed_config),
+                state: claimed_state,
+            });
+        }
+
+        if !standby {
+            pool_work_dir.set_started(true)?;
+        }
+        fs::write(pool_work_dir.shared_dir().join(".pool-claimed"), b"1\n")
+            .context("Failed to mark claimed pool VM")?;
+        if standby {
+            fs::write(pool_work_dir.shared_dir().join(".pool-standby"), b"1\n")
+                .context("Failed to mark standby pool VM")?;
+        }
+        fs::write(pool_work_dir.shared_dir().join(".pool-release"), b"1\n")
+            .context("Failed to release claimed pool VM")?;
+        let qmp_socket = pool_work_dir.qmp_socket();
+        tokio::task::spawn_blocking(move || crate::app::qemu::qmp_cont(&qmp_socket))
+            .await
+            .context("QMP cont task failed")??;
+        let source = source_disk.clone();
+        let destination = claimed_disk.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::app::qemu::replace_pool_data_disk(&source, &destination)?;
+            let file = fs::File::open(&destination)?;
+            file.sync_all()?;
+            anyhow::Ok(())
+        })
+        .await
+        .context("pool data disk copy task failed")??;
+        fs::write(pool_work_dir.shared_dir().join(".pool-disk-ready"), b"1\n")
+            .context("Failed to mark pool data disk ready")?;
+        let _ = fs::remove_file(pool_work_dir.join(".pool-ready"));
+        let _ = fs::remove_file(pool_work_dir.join(".pool-claiming"));
+        let _ = fs::remove_file(&source_disk);
+        if target_runtime_id != pool_runtime_id {
+            let _ = self.supervisor.remove(&target_runtime_id).await;
+        }
+        if target_work_dir.path() != pool_work_dir.path() {
+            if let Err(err) = fs::remove_dir_all(target_work_dir.path()) {
+                warn!(
+                    logical_id = id,
+                    path = %target_work_dir.path().display(),
+                    "failed to remove replaced VM workdir: {err:?}"
+                );
+            }
+        }
+        info!(
+            logical_id = id,
+            pool_id = %pool.config.manifest.id,
+            runtime_id = %pool_runtime_id,
+            standby,
+            "started stopped VM from warm pool"
+        );
+        Ok(true)
+    }
+
+    async fn prebind_restart_standby(&self, id: &str) -> Result<()> {
+        let claimed = self.claim_pool_for(id, true).await;
+        let claimed = match claimed {
+            Ok(claimed) => claimed,
+            Err(err) => {
+                self.lock().prebinding.remove(id);
+                return Err(err);
+            }
+        };
+        if !claimed {
+            self.lock().prebinding.remove(id);
+            return Ok(());
+        }
+        let work_dir = self.active_work_dir(id)?;
+        fs::write(work_dir.join(".pool-prebinding"), b"1\n")?;
+        let runtime_id = self.runtime_id(id);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        loop {
+            let progress = self
+                .lock()
+                .get(id)
+                .map(|vm| vm.state.boot_progress.clone())
+                .unwrap_or_default();
+            if progress == "pool standby" {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                warn!("standby for {id} did not reach the app barrier in 300s");
+                let _ = fs::remove_file(work_dir.join(".pool-prebinding"));
+                self.lock().prebinding.remove(id);
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let qmp_socket = work_dir.qmp_socket();
+        let stopped = tokio::task::spawn_blocking(move || crate::app::qemu::qmp_stop(&qmp_socket))
+            .await
+            .context("QMP stop task failed")?;
+        match stopped {
+            Ok(()) => {
+                fs::write(work_dir.join(".pool-app-paused"), b"1\n")?;
+                info!("restart standby for {id} ({runtime_id}) paused at the app barrier");
+            }
+            Err(err) => {
+                warn!("failed to pause standby for {id}: {err:?}");
+            }
+        }
+        let _ = fs::remove_file(work_dir.join(".pool-prebinding"));
+        self.lock().prebinding.remove(id);
+        Ok(())
+    }
+
+    async fn try_resume_standby(&self, id: &str) -> Result<bool> {
+        let work_dir = self.active_work_dir(id)?;
+        if self.lock().prebinding.contains(id) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+            loop {
+                if work_dir.join(".pool-app-paused").exists() {
+                    break;
+                }
+                if !self.lock().prebinding.contains(id) || std::time::Instant::now() >= deadline {
+                    return Ok(false);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+        if !work_dir.join(".pool-app-paused").exists() {
+            return Ok(false);
+        }
+        fs::write(work_dir.shared_dir().join(".pool-app-release"), b"1\n")
+            .context("Failed to release standby app barrier")?;
+        let _ = fs::remove_file(work_dir.join(".pool-app-paused"));
+        let qmp_socket = work_dir.qmp_socket();
+        tokio::task::spawn_blocking(move || crate::app::qemu::qmp_cont(&qmp_socket))
+            .await
+            .context("QMP cont task failed")??;
+        work_dir.set_started(true)?;
+        {
+            let mut state = self.lock();
+            if let Some(vm_state) = state.get_mut(id) {
+                vm_state.state.start(false);
+            }
+        }
+        info!("resumed pre-bound standby for {id}");
+        Ok(true)
+    }
+
     pub async fn start_vm(&self, id: &str) -> Result<()> {
+        if self.try_resume_standby(id).await? {
+            return Ok(());
+        }
+        if self.try_start_vm_from_pool(id).await? {
+            return Ok(());
+        }
         self.start_vm_with_restart_policy(id, true).await
     }
 
@@ -468,9 +805,10 @@ impl App {
             }
         }
         self.sync_dynamic_config(id)?;
+        let runtime_id = self.runtime_id(id);
         let is_running = self
             .supervisor
-            .info(id)
+            .info(&runtime_id)
             .await?
             .is_some_and(|info| info.state.status.is_running());
         self.set_started(id, true)?;
@@ -487,7 +825,7 @@ impl App {
         };
         let should_pause_pool = !is_running && vm_config.manifest.pool;
         if !is_running {
-            let work_dir = self.work_dir(id)?;
+            let work_dir = self.active_work_dir(id)?;
             for path in [work_dir.serial_pty(), work_dir.qmp_socket()] {
                 if path.symlink_metadata().is_ok() {
                     fs::remove_file(path)?;
@@ -571,7 +909,7 @@ impl App {
             let vm_state = state.get_mut(id).context("VM not found")?;
             vm_state.state.devices = devices;
         } else if vm_config.manifest.paused {
-            let qmp_socket = self.work_dir(id)?.qmp_socket();
+            let qmp_socket = self.active_work_dir(id)?.qmp_socket();
             let socket = qmp_socket.clone();
             let runstate =
                 tokio::task::spawn_blocking(move || crate::app::qemu::qmp_query_status(&socket))
@@ -585,7 +923,7 @@ impl App {
                 info!("resumed paused VM {id} via QMP cont (was {runstate})");
                 let mut manifest = vm_config.manifest.clone();
                 manifest.paused = false;
-                if let Err(err) = self.work_dir(id)?.put_manifest(&manifest) {
+                if let Err(err) = self.active_work_dir(id)?.put_manifest(&manifest) {
                     warn!("failed to clear paused flag for {id}: {err:?}");
                 }
                 let mut state = self.lock();
@@ -597,13 +935,13 @@ impl App {
             }
         }
         if should_pause_pool {
-            self.spawn_pause_pool_at_barrier(id.to_string(), self.work_dir(id)?);
+            self.spawn_pause_pool_at_barrier(id.to_string(), self.active_work_dir(id)?);
         }
         Ok(())
     }
 
     fn set_started(&self, id: &str, started: bool) -> Result<()> {
-        let work_dir = self.work_dir(id)?;
+        let work_dir = self.active_work_dir(id)?;
         work_dir
             .set_started(started)
             .context("Failed to set started")
@@ -614,9 +952,66 @@ impl App {
             vm.state.auto_restart.reset();
         }
         self.set_started(id, false)?;
-        self.stop_vm_process(id).await?;
-        let networks = self.work_dir(id)?.runtime_networks();
+        let runtime_id = self.runtime_id(id);
+        let work_dir = self.active_work_dir(id)?;
+        let qmp_socket = work_dir.qmp_socket();
+        let running = self
+            .supervisor
+            .info(&runtime_id)
+            .await?
+            .is_some_and(|info| info.state.status.is_running());
+        if running && qmp_socket.exists() {
+            let socket = qmp_socket.clone();
+            let powered_down = tokio::task::spawn_blocking(move || {
+                crate::app::qemu::qmp_system_powerdown(&socket)
+            })
+            .await
+            .map(|r| r.is_ok())
+            .unwrap_or(false);
+            if powered_down {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                loop {
+                    let still_running = self
+                        .supervisor
+                        .info(&runtime_id)
+                        .await?
+                        .is_some_and(|info| info.state.status.is_running());
+                    if !still_running {
+                        info!("VM {id} powered down cleanly via QMP");
+                        break;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        warn!("VM {id} ignored QMP powerdown for 20s, forcing stop");
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+            }
+        }
+        self.stop_vm_process(&runtime_id).await?;
+        let networks = work_dir.runtime_networks();
         self.remove_filtered_networks(id, &networks).await?;
+        let should_prebind = {
+            let mut state = self.lock();
+            let eligible = state
+                .get(id)
+                .map(|vm| !vm.state.removing && !vm.config.manifest.pool)
+                .unwrap_or(false);
+            if eligible {
+                state.prebinding.insert(id.to_string());
+            }
+            eligible
+        };
+        if should_prebind {
+            let app = self.clone();
+            let id = id.to_string();
+            tokio::spawn(async move {
+                if let Err(err) = app.prebind_restart_standby(&id).await {
+                    warn!("prebind restart standby for {id} failed: {err:?}");
+                    app.lock().prebinding.remove(&id);
+                }
+            });
+        }
         Ok(())
     }
 
@@ -646,7 +1041,7 @@ impl App {
                 nic_index,
             };
             let mac = network::mac_address_for_vm_index(
-                &vm.manifest.id,
+                vm.manifest.runtime_id(),
                 &network.mac_prefix_bytes(),
                 nic_index,
             );
@@ -750,37 +1145,38 @@ impl App {
     }
 
     pub(crate) async fn stop_vm_process(&self, id: &str) -> Result<()> {
-        let Some(info) = self.supervisor.info(id).await? else {
+        let runtime_id = self.runtime_id(id);
+        let Some(info) = self.supervisor.info(&runtime_id).await? else {
             return Ok(());
         };
         // Non-TPM VMs run QEMU directly and keep the existing Supervisor stop
         // path. Only the TPM launcher's hidden subcommand implements graceful
         // child-process shutdown.
         if info.config.args.first().map(String::as_str) != Some("vm-launcher") {
-            return self.supervisor.stop(id).await;
+            return self.supervisor.stop(&runtime_id).await;
         }
         if info.state.status.is_running() {
             let pid = info.state.pid.context("running VM launcher has no PID")?;
             if let Err(error) = signal_pidfd(pid, libc::SIGTERM) {
                 warn!(id, %pid, %error, "failed to signal VM launcher gracefully; forcing shutdown");
-                return self.supervisor.stop(id).await;
+                return self.supervisor.stop(&runtime_id).await;
             }
             for _ in 0..150 {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 let running = self
                     .supervisor
-                    .info(id)
+                    .info(&runtime_id)
                     .await?
                     .is_some_and(|info| info.state.status.is_running());
                 if !running {
                     // Synchronize Supervisor's `started` flag after the launcher
                     // completed its graceful child cleanup.
-                    return self.supervisor.stop(id).await;
+                    return self.supervisor.stop(&runtime_id).await;
                 }
             }
             warn!(id, "VM launcher did not stop gracefully; forcing shutdown");
         }
-        self.supervisor.stop(id).await
+        self.supervisor.stop(&runtime_id).await
     }
 
     pub async fn remove_vm(&self, id: &str) -> Result<()> {
@@ -795,7 +1191,7 @@ impl App {
         }
 
         // Persist the removing marker so crash recovery can resume
-        let work_dir = self.work_dir(id)?;
+        let work_dir = self.active_work_dir(id)?;
         if let Err(err) = work_dir.set_removing() {
             warn!("failed to write .removing marker for {id}: {err:?}");
         }
@@ -824,9 +1220,10 @@ impl App {
 
         // Poll until the process is no longer running, then remove it.
         // Some VMs take a long time to stop (e.g. 2+ hours), so we wait indefinitely.
+        let runtime_id = self.runtime_id(id);
         let mut poll_count: u64 = 0;
         loop {
-            match self.supervisor.info(id).await {
+            match self.supervisor.info(&runtime_id).await {
                 Ok(Some(info)) if info.state.status.is_running() => {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     poll_count += 1;
@@ -839,8 +1236,8 @@ impl App {
                 }
                 Ok(Some(_)) => {
                     // Not running — remove from supervisor
-                    if let Err(err) = self.supervisor.remove(id).await {
-                        warn!("supervisor.remove({id}) failed: {err:?}");
+                    if let Err(err) = self.supervisor.remove(&runtime_id).await {
+                        warn!("supervisor.remove({runtime_id}) failed: {err:?}");
                     }
                     break;
                 }
@@ -855,14 +1252,14 @@ impl App {
             }
         }
 
-        let runtime_networks = self.work_dir(id)?.runtime_networks();
+        let vm_path = self.active_work_dir(id)?;
+        let runtime_networks = vm_path.runtime_networks();
         if let Err(error) = self.remove_filtered_networks(id, &runtime_networks).await {
             warn!(id, %error, "failed to remove filtered networking during VM removal");
         }
 
         // Only delete the workdir for user-initiated removal or if .removing marker exists.
         // Orphaned supervisor processes without the marker keep their data intact.
-        let vm_path = self.work_dir(id)?;
         if delete_workdir || vm_path.is_removing() {
             if vm_path.path().exists() {
                 if let Err(err) = fs::remove_dir_all(&vm_path) {
@@ -954,7 +1351,13 @@ impl App {
                         error!("Failed to load VM: {err:?}");
                     }
                     if is_removing {
-                        if let Some(id) = vm_path.file_name().and_then(|n| n.to_str()) {
+                        if let Ok(manifest) = workdir.manifest() {
+                            info!(
+                                "Found VM {} with .removing marker, resuming cleanup",
+                                manifest.id
+                            );
+                            removing_ids.push(manifest.id);
+                        } else if let Some(id) = vm_path.file_name().and_then(|n| n.to_str()) {
                             info!("Found VM {id} with .removing marker, resuming cleanup");
                             removing_ids.push(id.to_string());
                         }
@@ -969,9 +1372,13 @@ impl App {
         }
 
         // Clean up orphaned supervisor processes (in supervisor but not loaded as VMs)
-        let loaded_vm_ids: HashSet<String> = self.lock().vms.keys().cloned().collect();
+        let loaded_runtime_ids: HashSet<String> = self
+            .lock()
+            .iter_vms()
+            .map(|vm| vm.config.manifest.runtime_id().to_string())
+            .collect();
         for (_, process) in &running_vms {
-            if !loaded_vm_ids.contains(&process.config.id) {
+            if !loaded_runtime_ids.contains(&process.config.id) {
                 info!(
                     "Cleaning up orphaned supervisor process: {}",
                     process.config.id
@@ -1030,8 +1437,10 @@ impl App {
                 let entry = entry.context("Failed to read directory entry")?;
                 let vm_dir_path = entry.path();
                 if vm_dir_path.is_dir() {
-                    // Try to get VM ID from directory name or manifest
-                    if let Some(vm_id) = vm_dir_path.file_name().and_then(|n| n.to_str()) {
+                    let workdir = VmWorkDir::new(&vm_dir_path);
+                    if let Ok(manifest) = workdir.manifest() {
+                        fs_vm_ids.insert(manifest.id);
+                    } else if let Some(vm_id) = vm_dir_path.file_name().and_then(|n| n.to_str()) {
                         fs_vm_ids.insert(vm_id.to_string());
                     }
                 }
@@ -1240,8 +1649,8 @@ impl App {
         let total = infos.len() as u32;
         let vms = paginate(infos, request.page, request.page_size)
             .map(|vm| {
-                let work_dir = self.work_dir(&vm.config.manifest.id)?;
-                let info = vm.merged_info(vms.get(&vm.config.manifest.id), &work_dir);
+                let work_dir = VmWorkDir::new(&vm.config.workdir);
+                let info = vm.merged_info(vms.get(vm.config.manifest.runtime_id()), &work_dir);
                 Ok(info.to_pb(&self.config.gateway, &self.config.cvm, request.brief))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1265,13 +1674,17 @@ impl App {
     }
 
     pub async fn vm_info(&self, id: &str) -> Result<Option<pb::VmInfo>> {
-        let proc_state = self.supervisor.info(id).await?;
+        let runtime_id = self.runtime_id(id);
+        let proc_state = self.supervisor.info(&runtime_id).await?;
         let state = self.lock();
         let Some(vm_state) = state.get(id) else {
             return Ok(None);
         };
         let info = vm_state
-            .merged_info(proc_state.as_ref(), &self.work_dir(id)?)
+            .merged_info(
+                proc_state.as_ref(),
+                &VmWorkDir::new(&vm_state.config.workdir),
+            )
             .to_pb(&self.config.gateway, &self.config.cvm, false);
         Ok(Some(info))
     }
@@ -1381,30 +1794,39 @@ impl App {
         Ok(work_dir)
     }
 
-    pub(crate) fn sync_dynamic_config(&self, id: &str) -> Result<()> {
-        let work_dir = self.work_dir(id)?;
-        let shared_dir = self.shared_dir(id)?;
-        let manifest = work_dir.manifest().context("Failed to read manifest")?;
+    fn sync_dynamic_config_for(&self, work_dir: &VmWorkDir, manifest: &Manifest) -> Result<()> {
+        let shared_dir = work_dir.shared_dir();
         let cfg = &self.config;
         let compose_hash = sha256_file(shared_dir.join(APP_COMPOSE))?;
         let app_compose = work_dir
             .app_compose()
             .context("Failed to get app compose")?;
         let mr_config = work_dir
-            .prepare_mr_config(&manifest, &cfg.cvm, &app_compose)
+            .prepare_mr_config(manifest, &cfg.cvm, &app_compose)
             .context("Failed to prepare mr_config")?;
         let sys_config_str = make_sys_config(
             cfg,
-            &manifest,
+            manifest,
             &hex::encode(compose_hash),
             mr_config,
             app_compose.requirements.as_ref(),
         )?;
         fs::write(shared_dir.join(SYS_CONFIG), &sys_config_str)
             .context("Failed to write vm config")?;
-        let simulator_config = simulator_config_for_manifest(&self.config.cvm, &manifest)?;
+        let simulator_config = simulator_config_for_manifest(&self.config.cvm, manifest)?;
         sync_tee_simulator_config(&shared_dir, simulator_config.as_ref(), &sys_config_str)?;
         Ok(())
+    }
+
+    pub(crate) fn sync_dynamic_config(&self, id: &str) -> Result<()> {
+        let work_dir = self.active_work_dir(id)?;
+        let manifest = self
+            .lock()
+            .get(id)
+            .map(|vm| vm.config.manifest.clone())
+            .or_else(|| work_dir.manifest().ok())
+            .context("Failed to read manifest")?;
+        self.sync_dynamic_config_for(&work_dir, &manifest)
     }
 
     pub(crate) fn kms_client(&self) -> Result<KmsClient<RaClient>> {
@@ -3089,6 +3511,8 @@ impl VmState {
 pub(crate) struct AppState {
     cid_pool: IdPool<u32>,
     vms: HashMap<String, VmState>,
+    /// Logical VM IDs with a restart-standby prebind in flight.
+    prebinding: HashSet<String>,
 }
 
 impl AppState {
