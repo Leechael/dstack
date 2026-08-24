@@ -124,6 +124,31 @@ if mount -t 9p -o trans=virtio,version=9p2000.L,ro host-shared /tmp/.host-shared
 			done
 		) &
 	fi
+	KMS_PREFETCH_URL=$(jq -r '.kms_urls[0] // empty' /tmp/.host-shared/.sys-config.json 2>/dev/null || true)
+	KMS_PREFETCH_URL=${KMS_PREFETCH_URL%/}
+	case "$KMS_PREFETCH_URL" in
+	*/prpc) ;;
+	*) [ -n "$KMS_PREFETCH_URL" ] && KMS_PREFETCH_URL="${KMS_PREFETCH_URL}/prpc" ;;
+	esac
+	if [ -n "$KMS_PREFETCH_URL" ]; then
+		mkdir -p "$WORK_DIR"
+		touch "$WORK_DIR/temp-ca-prefetch.started"
+		(
+			if curl -ksS --fail --max-time 30 -X POST "$KMS_PREFETCH_URL/GetTempCaCert?json" \
+				-H "content-type: application/json" -d '{}' \
+				-o "$WORK_DIR/temp-ca-prefetch.resp.json" 2>/dev/null; then
+				jq -n --arg url "$KMS_PREFETCH_URL" \
+					--slurpfile resp "$WORK_DIR/temp-ca-prefetch.resp.json" \
+					'{kms_url: $url, response: $resp[0], error: null}' \
+					>"$WORK_DIR/temp-ca-prefetch.json"
+			else
+				jq -n --arg url "$KMS_PREFETCH_URL" \
+					'{kms_url: $url, response: null, error: "curl prefetch failed"}' \
+					>"$WORK_DIR/temp-ca-prefetch.json"
+			fi
+			rm -f "$WORK_DIR/temp-ca-prefetch.resp.json"
+		) &
+	fi
 fi
 
 # Make sure the system time is synchronized

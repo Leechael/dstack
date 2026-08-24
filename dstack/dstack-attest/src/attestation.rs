@@ -9,7 +9,10 @@
 /// and REPORT_DATA occupies bytes 568..632 (64 bytes).
 pub const TDX_QUOTE_REPORT_DATA_RANGE: std::ops::Range<usize> = 568..632;
 
-use std::{borrow::Cow, time::SystemTime};
+use std::{
+    borrow::Cow,
+    time::{Instant, SystemTime},
+};
 
 use anyhow::{anyhow, bail, Context, Result};
 use cc_eventlog::{EventLogVersion, RuntimeEvent, TdxEvent};
@@ -179,12 +182,23 @@ impl AttestationVerifier {
     }
 
     async fn verify_tdx_quote(&self, quote: &[u8]) -> Result<TdxVerifiedReport> {
+        let collateral_start = Instant::now();
         let collateral = self.tdx_collateral.fetch(quote).await?;
+        tracing::info!(
+            "KMS_TIMING2 stage=collateral_fetch elapsed_ms={}",
+            collateral_start.elapsed().as_millis()
+        );
+        let quote_verify_start = Instant::now();
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .context("system clock is before UNIX epoch")?
             .as_secs();
-        self.tdx.verify(quote, &collateral, now)
+        let report = self.tdx.verify(quote, &collateral, now)?;
+        tracing::info!(
+            "KMS_TIMING2 stage=quote_verify elapsed_ms={}",
+            quote_verify_start.elapsed().as_millis()
+        );
+        Ok(report)
     }
 }
 
