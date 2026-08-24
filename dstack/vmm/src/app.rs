@@ -1716,42 +1716,51 @@ impl App {
             error!("Event body too large, skipping");
             return Ok(());
         }
-        let mut state = self.lock();
-        let Some(vm) = state.vms.values_mut().find(|vm| vm.config.cid == cid) else {
-            bail!("VM not found");
-        };
-        vm.state.events.push_back(pb::GuestEvent {
-            event: event.into(),
-            body: body.clone(),
-            timestamp: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
-        });
-        while vm.state.events.len() > self.config.event_buffer_size {
-            vm.state.events.pop_front();
-        }
-        match event {
-            "boot.progress" => {
-                vm.state.boot_progress = body;
+        let mut clear_started = None;
+        let mut instance_info = None;
+        {
+            let mut state = self.lock();
+            let Some(vm) = state.vms.values_mut().find(|vm| vm.config.cid == cid) else {
+                bail!("VM not found");
+            };
+            vm.state.events.push_back(pb::GuestEvent {
+                event: event.into(),
+                body: body.clone(),
+                timestamp: SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+            });
+            while vm.state.events.len() > self.config.event_buffer_size {
+                vm.state.events.pop_front();
             }
-            "boot.error" => {
-                vm.state.boot_error = body;
-            }
-            "shutdown.progress" => {
-                if body == "powering off" {
-                    self.set_started(&vm.config.manifest.id, false)?;
+            match event {
+                "boot.progress" => {
+                    vm.state.boot_progress = body;
                 }
-                vm.state.shutdown_progress = body;
+                "boot.error" => {
+                    vm.state.boot_error = body;
+                }
+                "shutdown.progress" => {
+                    if body == "powering off" {
+                        clear_started = Some(vm.config.manifest.id.clone());
+                    }
+                    vm.state.shutdown_progress = body;
+                }
+                "instance.info" => {
+                    instance_info = Some((vm.config.workdir.clone(), body));
+                }
+                _ => {
+                    error!("Guest reported unknown event: {event}");
+                }
             }
-            "instance.info" => {
-                let workdir = VmWorkDir::new(vm.config.workdir.clone());
-                let instancd_info_path = workdir.instance_info_path();
-                safe_write::safe_write(&instancd_info_path, &body)?;
-            }
-            _ => {
-                error!("Guest reported unknown event: {event}");
-            }
+        }
+        if let Some(id) = clear_started {
+            self.set_started(&id, false)?;
+        }
+        if let Some((workdir, body)) = instance_info {
+            let instancd_info_path = VmWorkDir::new(workdir).instance_info_path();
+            safe_write::safe_write(&instancd_info_path, &body)?;
         }
         Ok(())
     }
