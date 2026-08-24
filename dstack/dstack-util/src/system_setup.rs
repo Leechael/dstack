@@ -2609,12 +2609,30 @@ impl<'a> Stage0<'a> {
 
     async fn setup_swapfile(&self, swap_size: u64) -> Result<()> {
         let swapfile = self.args.mount_point.join("swapfile");
+        if swap_size == 0 {
+            if swapfile.exists() {
+                fs::remove_file(&swapfile).context("Failed to remove swapfile")?;
+                info!("Removed existing swapfile");
+            }
+            return Ok(());
+        }
         if swapfile.exists() {
+            let existing_size = swapfile
+                .metadata()
+                .context("Failed to stat existing swapfile")?
+                .len();
+            if existing_size == swap_size {
+                info!("Reusing existing swapfile at {} ({existing_size} bytes)", swapfile.display());
+                let swapfile = swapfile.display().to_string();
+                cmd! {
+                    swapon $swapfile;
+                    swapon --show;
+                }
+                .context("Failed to enable existing swapfile")?;
+                return Ok(());
+            }
             fs::remove_file(&swapfile).context("Failed to remove swapfile")?;
             info!("Removed existing swapfile");
-        }
-        if swap_size == 0 {
-            return Ok(());
         }
         let swapfile = swapfile.display().to_string();
         info!("Creating swapfile at {swapfile} (size {swap_size} bytes)");
@@ -2778,7 +2796,7 @@ impl<'a> Stage0<'a> {
                 FsType::Ext4 => {
                     info!("Creating ext4 filesystem");
                     cmd! {
-                        mkfs.ext4 -F $fs_dev;
+                        mkfs.ext4 -F -K -E lazy_itable_init=1,lazy_journal_init=1 $fs_dev;
                         mount $fs_dev $mount_point;
                     }
                     .context("Failed to create ext4 filesystem")?;
@@ -2871,6 +2889,8 @@ impl<'a> Stage0<'a> {
                 "aes-xts-plain64",
                 "--pbkdf",
                 "pbkdf2",
+                "--pbkdf-force-iterations",
+                "1000",
                 "-d-",
             ])
             .arg(root_hd)
