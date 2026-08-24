@@ -564,6 +564,7 @@ impl App {
             return Ok(false);
         }
 
+        let candidate_count = candidates.len();
         let mut selected = None;
         for candidate in candidates {
             let runtime_id = candidate.config.manifest.runtime_id().to_string();
@@ -592,7 +593,7 @@ impl App {
         let Some(pool) = selected else {
             warn!(
                 id,
-                candidates = candidates.len(),
+                candidates = candidate_count,
                 "skip pool claim: no paused pool member"
             );
             return Ok(false);
