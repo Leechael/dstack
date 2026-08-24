@@ -1150,6 +1150,8 @@ mod tests {
             simulated_tee: None,
             networking: None,
             networks: vec![],
+            paused: false,
+            pool: false,
         }
     }
 
