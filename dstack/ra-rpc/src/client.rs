@@ -2,7 +2,10 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{bail, Context, Result};
 use prpc::{
@@ -110,6 +113,20 @@ impl RaClient {
             .context("failed to create client")
     }
 
+    /// Issues a plain GET to the RPC base URI and drains the response so the
+    /// connection returns to the keep-alive pool. Any HTTP status (including
+    /// 404/405) counts as success; only transport-level failures are errors.
+    pub async fn warmup_connection(&self) -> Result<()> {
+        let response = self
+            .client
+            .get(&self.remote_uri)
+            .send()
+            .await
+            .context("Failed to warm up connection")?;
+        let _ = response.bytes().await;
+        Ok(())
+    }
+
     pub fn new_mtls(
         remote_uri: String,
         cert_pem: String,
@@ -152,6 +169,7 @@ impl RaClient {
             match ra_tls::attestation::from_cert(&cert).context("Failed to parse attestation")? {
                 None => None,
                 Some(attestation) => {
+                    let quote_verify_start = Instant::now();
                     let verified_attestation = attestation
                         .into_v1()
                         .verify_with_ra_pubkey(cert.public_key().raw, &self.attestation_verifier)
@@ -159,6 +177,10 @@ impl RaClient {
                         .context(
                             "failed to verify the attestation report presented by the server",
                         )?;
+                    tracing::info!(
+                        "KMS_TIMING2 stage=server_quote_verify elapsed_ms={}",
+                        quote_verify_start.elapsed().as_millis()
+                    );
                     Some(verified_attestation)
                 }
             }
@@ -169,7 +191,13 @@ impl RaClient {
             special_usage,
             app_id,
         };
-        validator(Some(cert_info))
+        let validator_start = Instant::now();
+        let result = validator(Some(cert_info));
+        tracing::info!(
+            "KMS_TIMING2 stage=cert_validator elapsed_ms={}",
+            validator_start.elapsed().as_millis()
+        );
+        result
     }
 }
 
@@ -209,6 +237,7 @@ impl RequestClient for RaClient {
     {
         let body = serde_json::to_vec(&body).context("Failed to serialize body")?;
         let url = format!("{}/{}?json", self.remote_uri, path);
+        let send_start = Instant::now();
         let response = self
             .client
             .post(url)
@@ -216,10 +245,12 @@ impl RequestClient for RaClient {
             .send()
             .await
             .context("Failed to send request")?;
+        let send_elapsed = send_start.elapsed();
 
         // Name the direction explicitly: this validates the *server's* attestation,
         // not the client's own quote. Without it the error chain reads as if the
         // remote end rejected us.
+        let validate_start = Instant::now();
         self.try_validate_attestation(&response)
             .await
             .with_context(|| {
@@ -228,17 +259,27 @@ impl RequestClient for RaClient {
                     self.remote_uri
                 )
             })?;
+        let validate_elapsed = validate_start.elapsed();
 
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             bail!("Request failed with status={status}, error={body}");
         }
+        let body_start = Instant::now();
         let body = response
             .bytes()
             .await
             .context("Failed to read response")?
             .to_vec();
+        let body_elapsed = body_start.elapsed();
+        tracing::info!(
+            "KMS_TIMING2 stage=rpc_timing rpc={} send_headers_ms={} validate_ms={} body_read_ms={}",
+            path,
+            send_elapsed.as_millis(),
+            validate_elapsed.as_millis(),
+            body_elapsed.as_millis()
+        );
         let response = serde_json::from_slice(normalize_json_response_body(&body))
             .context("Failed to deserialize response")?;
         Ok(response)

@@ -122,6 +122,11 @@ message VmConfiguration {
   // Development-only TEE ABI to simulate for this VM. When set, the VMM
   // launches a non-TEE VM and provides an instance-specific simulator config.
   optional string simulated_tee = 21;
+  // Launch QEMU with -S and hold the guest at reset until StartVm resumes it.
+  bool paused = 22;
+  // Warm-pool member: omit shared/.pool-release so the guest waits at the
+  // pool barrier until a claim provisions the real config.
+  bool pool = 23;
 }
 
 // Per-VM networking configuration.

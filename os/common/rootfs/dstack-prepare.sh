@@ -94,6 +94,63 @@ mount_overlay /usr "$OVERLAY_TMP"
 mount_overlay /bin "$OVERLAY_TMP"
 mount_overlay /home "$OVERLAY_TMP"
 
+# Prefetch the KMS temp CA and warm PCCS in the background so those RTTs
+# overlap time sync and disk setup. Pooled CVMs wait here until the VMM
+# writes the real config and .pool-release.
+mkdir -p /tmp/.host-shared
+if mount -t 9p -o trans=virtio,version=9p2000.L,ro,cache=none host-shared /tmp/.host-shared 2>/dev/null; then
+	PCCS_WARM_URL=$(jq -r '.pccs_url // empty' /tmp/.host-shared/.sys-config.json 2>/dev/null || true)
+	if [ ! -e /tmp/.host-shared/.pool-release ]; then
+		log "pool barrier: .pool-release missing, waiting for claim"
+		dstack-util notify-host -e "boot.progress" -d "pool barrier" || true
+		POOL_WAIT=0
+		while [ ! -e /tmp/.host-shared/.pool-release ]; do
+			if [ "$POOL_WAIT" -ge 6000 ]; then
+				log "pool barrier: timeout, continuing"
+				break
+			fi
+			sleep 0.02
+			POOL_WAIT=$((POOL_WAIT + 1))
+		done
+	fi
+	if [ -n "$PCCS_WARM_URL" ]; then
+		(
+			for path in \
+				"/sgx/certification/v4/root-cacrl" \
+				"/sgx/certification/v4/pckcrl?ca=processor&encoding=der" \
+				"/sgx/certification/v4/qe/identity" \
+				"/sgx/certification/v4/tcb?fmspc=B0C06F000000"; do
+				curl -fsS --max-time 2 "${PCCS_WARM_URL}${path}" >/dev/null 2>&1 || true
+			done
+		) &
+	fi
+	KMS_PREFETCH_URL=$(jq -r '.kms_urls[0] // empty' /tmp/.host-shared/.sys-config.json 2>/dev/null || true)
+	KMS_PREFETCH_URL=${KMS_PREFETCH_URL%/}
+	case "$KMS_PREFETCH_URL" in
+	*/prpc) ;;
+	*) [ -n "$KMS_PREFETCH_URL" ] && KMS_PREFETCH_URL="${KMS_PREFETCH_URL}/prpc" ;;
+	esac
+	if [ -n "$KMS_PREFETCH_URL" ]; then
+		mkdir -p "$WORK_DIR"
+		touch "$WORK_DIR/temp-ca-prefetch.started"
+		(
+			if curl -ksS --fail --max-time 30 -X POST "$KMS_PREFETCH_URL/GetTempCaCert?json" \
+				-H "content-type: application/json" -d '{}' \
+				-o "$WORK_DIR/temp-ca-prefetch.resp.json" 2>/dev/null; then
+				jq -n --arg url "$KMS_PREFETCH_URL" \
+					--slurpfile resp "$WORK_DIR/temp-ca-prefetch.resp.json" \
+					'{kms_url: $url, response: $resp[0], error: null}' \
+					>"$WORK_DIR/temp-ca-prefetch.json"
+			else
+				jq -n --arg url "$KMS_PREFETCH_URL" \
+					'{kms_url: $url, response: null, error: "curl prefetch failed"}' \
+					>"$WORK_DIR/temp-ca-prefetch.json"
+			fi
+			rm -f "$WORK_DIR/temp-ca-prefetch.resp.json"
+		) &
+	fi
+fi
+
 # Make sure the system time is synchronized
 log "Syncing system time..."
 # Let the chronyd correct the system time immediately; keep booting if chronyd is not ready yet.
@@ -162,17 +219,18 @@ has_luks_header() {
 
 create_data_partition() {
 	local disk="$1"
+	local part_device
 	log "Creating GPT partition table on ${disk}..."
 	if ! command -v sgdisk >/dev/null 2>&1; then
 		log "Error: sgdisk not available, cannot create partition table"
 		return 1
 	fi
-	# Create GPT with single partition filling entire disk
-	sgdisk -Z "$disk" >/dev/null || true # Zap any existing data
-	sgdisk -n 1:1MiB:0 -c 1:dstack-data -t 1:8300 "$disk" >/dev/null || return 1
-	# Trigger kernel to re-read partition table
+	# Replace any stale partition metadata and create one partition spanning the disk.
+	# A single sgdisk invocation avoids writing and flushing the GPT twice.
+	sgdisk -o -n 1:1MiB:0 -c 1:dstack-data -t 1:8300 "$disk" >/dev/null || return 1
+	# Trigger kernel to re-read the partition table and wait for the device node.
 	blockdev --rereadpt "$disk" >/dev/null || true
-	udevadm settle >/dev/null || sleep 1
+	udevadm settle --timeout=3 >/dev/null || sleep 0.1
 	part_device=$(
 		lsblk -nr -o PATH "$disk" 2>/dev/null | sed -n '2p'
 	)
@@ -183,6 +241,26 @@ create_data_partition() {
 	fi
 	log "Failed to create partition"
 	return 1
+}
+
+partition_needs_grow() {
+	local disk="$1"
+	local partition="$2"
+	local disk_sectors part_start part_sectors part_end remaining
+
+	disk_sectors=$(blockdev --getsz "$disk" 2>/dev/null || true)
+	part_start=$(cat "/sys/class/block/${partition}/start" 2>/dev/null || true)
+	part_sectors=$(cat "/sys/class/block/${partition}/size" 2>/dev/null || true)
+	if ! [[ "$disk_sectors" =~ ^[0-9]+$ && "$part_start" =~ ^[0-9]+$ && "$part_sectors" =~ ^[0-9]+$ ]]; then
+		log "Unable to compare partition and disk sizes; preserving resize fallback"
+		return 0
+	fi
+
+	part_end=$((part_start + part_sectors))
+	remaining=$((disk_sectors - part_end))
+	# A normal GPT leaves only its backup header at the end of the disk. Allow a
+	# 2 MiB alignment margin; a real VMM disk expansion is much larger than this.
+	[ "$remaining" -gt 4096 ]
 }
 
 choose_data_device() {
@@ -262,43 +340,51 @@ if [ -f "/sys/class/block/${device_name}/partition" ]; then
 
 	if [ -n "$parent_disk" ] && [ -b "$parent_disk" ]; then
 		log "Parent disk: ${parent_disk}"
-		if command -v sgdisk >/dev/null 2>&1; then
-			log "Refreshing GPT on ${parent_disk}..."
-			sgdisk -e "$parent_disk" 2>/dev/null || true
-		fi
-		if command -v parted >/dev/null 2>&1; then
-			part_num=$(cat "/sys/class/block/${device_name}/partition" 2>/dev/null || echo "")
-			if [ -n "$part_num" ]; then
-				log "Growing partition ${part_num} on ${parent_disk} via parted..."
-				parted --script "$parent_disk" resizepart "$part_num" 100% 2>/dev/null || log "Partition already at maximum size"
+		if partition_needs_grow "$parent_disk" "$device_name"; then
+			if command -v sgdisk >/dev/null 2>&1; then
+				log "Refreshing GPT on ${parent_disk}..."
+				sgdisk -e "$parent_disk" 2>/dev/null || true
 			fi
-		else
-			log "Warning: parted not available; unable to auto-resize ${DATA_DEVICE}"
+			if command -v parted >/dev/null 2>&1; then
+				part_num=$(cat "/sys/class/block/${device_name}/partition" 2>/dev/null || echo "")
+				if [ -n "$part_num" ]; then
+					log "Growing partition ${part_num} on ${parent_disk} via parted..."
+					parted --script "$parent_disk" resizepart "$part_num" 100% 2>/dev/null || log "Partition already at maximum size"
+				fi
+			else
+				log "Warning: parted not available; unable to auto-resize ${DATA_DEVICE}"
+			fi
+			# Trigger kernel to re-read partition table
+			blockdev --rereadpt "$parent_disk" 2>/dev/null || true
 		fi
-		# Trigger kernel to re-read partition table
-		blockdev --rereadpt "$parent_disk" 2>/dev/null || true
 	fi
 fi
 
 dstack-util setup --work-dir $WORK_DIR --device "$DATA_DEVICE" --mount-point $DATA_MNT
 
-log "Mounting container runtime dirs to persistent storage"
-mkdir -p $DATA_MNT/var/lib/docker
-mkdir -p $DATA_MNT/var/lib/containerd
-mkdir -p $DATA_MNT/var/lib/containerd-stargz-grpc
-mkdir -p $DATA_MNT/var/lib/nerdctl
-mkdir -p $DATA_MNT/var/lib/sysbox
-mkdir -p /var/lib/docker
-mkdir -p /var/lib/containerd
-mkdir -p /var/lib/containerd-stargz-grpc
-mkdir -p /var/lib/nerdctl
-mkdir -p /var/lib/sysbox
-mount --rbind $DATA_MNT/var/lib/docker /var/lib/docker
-mount --rbind $DATA_MNT/var/lib/containerd /var/lib/containerd
-mount --rbind $DATA_MNT/var/lib/containerd-stargz-grpc /var/lib/containerd-stargz-grpc
-mount --rbind $DATA_MNT/var/lib/nerdctl /var/lib/nerdctl
-mount --rbind $DATA_MNT/var/lib/sysbox /var/lib/sysbox
 mount --rbind $WORK_DIR /dstack
+
+RUNNER=$(jq -r '.runner' /dstack/app-compose.json)
+case "$RUNNER" in
+docker-compose|nerdctl-compose)
+	log "Mounting container runtime dirs to persistent storage"
+	mkdir -p $DATA_MNT/var/lib/docker
+	mkdir -p $DATA_MNT/var/lib/containerd
+	mkdir -p $DATA_MNT/var/lib/containerd-stargz-grpc
+	mkdir -p $DATA_MNT/var/lib/nerdctl
+	mkdir -p $DATA_MNT/var/lib/sysbox
+	mkdir -p /var/lib/docker
+	mkdir -p /var/lib/containerd
+	mkdir -p /var/lib/containerd-stargz-grpc
+	mkdir -p /var/lib/nerdctl
+	mkdir -p /var/lib/sysbox
+	mount --rbind $DATA_MNT/var/lib/docker /var/lib/docker
+	mount --rbind $DATA_MNT/var/lib/containerd /var/lib/containerd
+	mount --rbind $DATA_MNT/var/lib/containerd-stargz-grpc /var/lib/containerd-stargz-grpc
+	mount --rbind $DATA_MNT/var/lib/nerdctl /var/lib/nerdctl
+	mount --rbind $DATA_MNT/var/lib/sysbox /var/lib/sysbox
+	;;
+esac
 
 echo "======== Disk usage ========"
 df -h

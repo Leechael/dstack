@@ -115,11 +115,49 @@ validate_runner
 
 case "$ACTION" in
 start)
+    case "$runner" in
+    docker-compose|nerdctl-compose)
+        echo "Starting container runtimes"
+        if ! systemctl start sysbox.service docker.service containerd.service containerd-stargz-grpc.service; then
+            dstack-util notify-host -e "boot.error" -d "failed to start container runtimes"
+            exit 1
+        fi
+        ;;
+    esac
+
     if [ "$(jq 'has("pre_launch_script")' "$APP_COMPOSE_FILE")" = true ]; then
         echo "Running pre-launch script"
         dstack-util notify-host -e "boot.progress" -d "pre-launch" || true
         # shellcheck disable=SC1090
         source <(jq -r '.pre_launch_script' "$APP_COMPOSE_FILE")
+    fi
+
+    # Keep the standby checkpoint self-contained: a resumed StartVm should
+    # only create containers, never re-run housekeeping that already ran while
+    # the VM was being parked.
+    if [ -e /tmp/.host-shared/.pool-standby ] && [ ! -e /tmp/.host-shared/.pool-app-release ]; then
+        case "$runner" in
+        docker-compose)
+            echo "Pruning unused Docker images and volumes before standby"
+            docker image prune -af
+            docker volume prune -f
+            ;;
+        nerdctl-compose)
+            echo "Pruning unused containerd images before standby"
+            nerdctl --namespace "$NERDCTL_NAMESPACE" --snapshotter "$snapshotter" image prune -af
+            ;;
+        esac
+        echo "pool app barrier: standby ready, waiting for start"
+        dstack-util notify-host -e "boot.progress" -d "pool standby" || true
+        APP_WAIT=0
+        while [ ! -e /tmp/.host-shared/.pool-app-release ]; do
+            if [ "$APP_WAIT" -ge 15000 ]; then
+                echo "pool app barrier: timeout, continuing"
+                break
+            fi
+            sleep 0.02
+            APP_WAIT=$((APP_WAIT + 1))
+        done
     fi
 
     case "$runner" in
@@ -130,13 +168,15 @@ start)
             dstack-util notify-host -e "boot.error" -d "failed to start containers"
             exit 1
         fi
-        if [ "$runner" = docker-compose ]; then
-            echo "Pruning unused Docker images and volumes"
-            docker image prune -af
-            docker volume prune -f
-        else
-            echo "Pruning unused containerd images"
-            nerdctl --namespace "$NERDCTL_NAMESPACE" --snapshotter "$snapshotter" image prune -af
+        if [ ! -e /tmp/.host-shared/.pool-app-release ]; then
+            if [ "$runner" = docker-compose ]; then
+                echo "Pruning unused Docker images and volumes"
+                docker image prune -af
+                docker volume prune -f
+            else
+                echo "Pruning unused containerd images"
+                nerdctl --namespace "$NERDCTL_NAMESPACE" --snapshotter "$snapshotter" image prune -af
+            fi
         fi
         ;;
     bash)

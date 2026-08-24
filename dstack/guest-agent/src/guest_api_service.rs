@@ -66,7 +66,11 @@ impl GuestApiRpc for GuestApiHandler {
             )
             .await;
             let mut command = Command::new("systemctl");
-            command.arg("poweroff").kill_on_drop(true);
+            // --force --force skips the systemd transaction queue so a wedged
+            // container runtime cannot delay the poweroff indefinitely.
+            command
+                .args(["poweroff", "--force", "--force"])
+                .kill_on_drop(true);
             perr(
                 timeout(POWEROFF_COMMAND_TIMEOUT, command.status())
                     .await

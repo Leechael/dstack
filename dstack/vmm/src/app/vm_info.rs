@@ -177,6 +177,8 @@ impl VmInfo {
                         .map(|platform| platform.as_str().to_string()),
                     networking: configured_networking,
                     networks: configured_networks,
+                    paused: self.manifest.paused,
+                    pool: self.manifest.pool,
                 })
             },
             app_url: self

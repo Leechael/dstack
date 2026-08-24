@@ -31,6 +31,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    time::Duration,
 };
 use supervisor_client::supervisor::ProcessConfig;
 
@@ -163,7 +164,76 @@ fn create_hd(
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    if let Err(err) = write_data_gpt(image_file.as_ref()) {
+        tracing::warn!(
+            "failed to pre-create GPT on {}: {err:#}; guest will partition the disk on first boot",
+            image_file.as_ref().display()
+        );
+    }
     Ok(())
+}
+
+/// Best-effort: write a GPT with a single `dstack-data` partition (1MiB to end
+/// of disk, type 8300) into a freshly created qcow2 data disk, mirroring the
+/// guest-side `create_data_partition` so the guest can skip partitioning on
+/// first boot. Failures are logged by the caller; the guest fallback remains.
+fn write_data_gpt(image_file: &Path) -> Result<()> {
+    which::which("qemu-nbd").context("qemu-nbd not found")?;
+    which::which("sgdisk").context("sgdisk not found")?;
+    let _ = Command::new("sudo")
+        .args(["-n", "modprobe", "nbd"])
+        .output();
+    let nbd_name = (0..16)
+        .map(|i| format!("nbd{i}"))
+        .find(|name| {
+            fs::read_to_string(format!("/sys/block/{name}/pid"))
+                .map(|pid| pid.trim().is_empty())
+                .unwrap_or(true)
+        })
+        .context("no free nbd device found")?;
+    let nbd_path = format!("/dev/{nbd_name}");
+    let image = image_file.display().to_string();
+    let run = |args: &[&str]| -> Result<()> {
+        let output = Command::new("sudo")
+            .arg("-n")
+            .args(args)
+            .output()
+            .with_context(|| format!("failed to run: {}", args.join(" ")))?;
+        if !output.status.success() {
+            bail!(
+                "`{}` failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
+    };
+    run(&[
+        "qemu-nbd",
+        "--connect",
+        &nbd_path,
+        "--format",
+        "qcow2",
+        &image,
+    ])?;
+    let result = (|| -> Result<()> {
+        run(&["sgdisk", "-Z", &nbd_path])?;
+        run(&[
+            "sgdisk",
+            "-n",
+            "1:1MiB:0",
+            "-c",
+            "1:dstack-data",
+            "-t",
+            "1:8300",
+            &nbd_path,
+        ])?;
+        Ok(())
+    })();
+    let _ = Command::new("sudo")
+        .args(["-n", "qemu-nbd", "--disconnect", &nbd_path])
+        .output();
+    result
 }
 
 fn virtio_pci_device(device: &str, snp: bool) -> String {
@@ -252,10 +322,14 @@ impl PreparedQemuLaunch {
         prepare_shared_disk(&workdir, cfg)?;
 
         let tee_enabled = !vm.manifest.no_tee;
+        // Pool VMs are claimed with a per-app compose only after the TD is
+        // built, so the compose binding baked into MRCONFIGID cannot be known
+        // at launch. RTMR3 + KMS still constrain the claimed compose.
         let tdx_mr_config_id = if tee_enabled
             && platform == CvmPlatform::Tdx
             && cfg.use_mrconfigid
             && vm.image.info.version_tuple().unwrap_or_default() >= (0, 5, 2)
+            && !vm.manifest.pool
         {
             Some(tdx_mr_config_id(&workdir, &app_compose)?)
         } else {
@@ -292,14 +366,53 @@ impl PreparedQemuLaunch {
     }
 }
 
+fn create_pool_hd(image_file: &Path, size: &str) -> Result<()> {
+    let output = Command::new("qemu-img")
+        .args(["create", "-f", "raw"])
+        .arg(image_file)
+        .arg(size)
+        .output()
+        .context("Failed to create raw pool data disk")?;
+    if !output.status.success() {
+        bail!(
+            "Failed to create raw pool data disk: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let output = Command::new("sgdisk")
+        .args([
+            "-o",
+            "-n",
+            "1:1MiB:0",
+            "-c",
+            "1:dstack-data",
+            "-t",
+            "1:8300",
+        ])
+        .arg(image_file)
+        .output()
+        .context("Failed to partition raw pool data disk")?;
+    if !output.status.success() {
+        bail!(
+            "Failed to partition raw pool data disk: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
 fn prepare_data_disk(vm: &VmConfig, workdir: &VmWorkDir) -> Result<()> {
     let hda_path = workdir.hda_path();
     if !hda_path.exists() {
-        create_hd(
-            &hda_path,
-            vm.image.hda.as_ref(),
-            &format!("{}G", vm.manifest.disk_size),
-        )?;
+        if vm.manifest.pool {
+            create_pool_hd(&hda_path, &format!("{}G", vm.manifest.disk_size))?;
+        } else {
+            create_hd(
+                &hda_path,
+                vm.image.hda.as_ref(),
+                &format!("{}G", vm.manifest.disk_size),
+            )?;
+        }
     }
     Ok(())
 }
@@ -422,7 +535,7 @@ impl VmConfig {
         let executable =
             std::env::current_exe().context("failed to locate dstack-vmm executable")?;
         let launcher = ProcessConfig {
-            id: self.manifest.id.clone(),
+            id: self.manifest.runtime_id().to_string(),
             name: self.manifest.name.clone(),
             command: executable.to_string_lossy().into_owned(),
             args: vec![
@@ -494,11 +607,15 @@ impl QemuCommandBuilder<'_> {
             workdir.serial_file().display()
         ));
         command.arg("-serial").arg("chardev:com0");
-        if self.cfg.qmp_socket {
+        if self.cfg.qmp_socket || self.vm.manifest.paused || self.vm.manifest.pool {
             command.arg("-qmp").arg(format!(
                 "unix:{},server,wait=off",
                 workdir.qmp_socket().display()
             ));
+        }
+        if self.vm.manifest.paused {
+            // Hold the guest at reset; StartVm resumes it via QMP `cont`.
+            command.arg("-S");
         }
         if let Some(bios) = self.vm.image.firmware(self.is_amd_sev_snp()) {
             command.arg("-bios").arg(bios);
@@ -558,12 +675,23 @@ impl QemuCommandBuilder<'_> {
     }
 
     fn configure_data_disk(&self, command: &mut Command) {
-        command
-            .arg("-drive")
-            .arg(format!(
+        // Pool VMs boot with the normal virtio-blk topology but a raw GPT-only
+        // placeholder. While QEMU is paused, claim overwrites that inode with
+        // the original encrypted disk (file.locking=off).
+        let data_drive = if self.vm.manifest.pool {
+            format!(
+                "file={},if=none,id=hd1,format=raw,file.locking=off",
+                self.prepared.workdir.hda_path().display()
+            )
+        } else {
+            format!(
                 "file={},if=none,id=hd1",
                 self.prepared.workdir.hda_path().display()
-            ))
+            )
+        };
+        command
+            .arg("-drive")
+            .arg(data_drive)
             .arg("-device")
             .arg(virtio_pci_device(
                 "virtio-blk-pci,drive=hd1",
@@ -600,7 +728,7 @@ impl QemuCommandBuilder<'_> {
         for (index, networking) in self.prepared.networks.iter().enumerate() {
             let net_id = format!("net{index}");
             let mac = mac_address_for_vm_index(
-                &self.vm.manifest.id,
+                self.vm.manifest.runtime_id(),
                 &networking.mac_prefix_bytes(),
                 index,
             );
@@ -831,7 +959,7 @@ impl QemuCommandBuilder<'_> {
             serial_logappend: true,
         })?;
         Ok(ProcessConfig {
-            id: self.vm.manifest.id.clone(),
+            id: self.vm.manifest.runtime_id().to_string(),
             args: arguments,
             name: self.vm.manifest.name.clone(),
             command,
@@ -1013,6 +1141,123 @@ fn find_numa(device: Option<String>) -> Result<(String, String)> {
     Ok((numa_node, cpus))
 }
 
+/// Execute QMP commands over the VM unix monitor socket, returning responses.
+pub(crate) fn qmp_execute(socket: &Path, commands: &[&str]) -> Result<Vec<serde_json::Value>> {
+    use std::io::{BufRead, BufReader};
+    let stream = std::os::unix::net::UnixStream::connect(socket)
+        .with_context(|| format!("failed to connect to QMP socket {}", socket.display()))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .context("failed to set QMP read timeout")?;
+    let mut writer = stream.try_clone().context("failed to clone QMP stream")?;
+    let mut reader = BufReader::new(stream);
+    fn read_response(
+        reader: &mut BufReader<std::os::unix::net::UnixStream>,
+    ) -> Result<serde_json::Value> {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = reader
+                .read_line(&mut line)
+                .context("failed to read QMP message")?;
+            if n == 0 {
+                bail!("QMP connection closed");
+            }
+            let value: serde_json::Value =
+                serde_json::from_str(line.trim()).context("invalid QMP JSON")?;
+            if value.get("event").is_some() {
+                continue;
+            }
+            return Ok(value);
+        }
+    }
+    read_response(&mut reader).context("failed to read QMP greeting")?;
+    writer
+        .write_all(b"{\"execute\":\"qmp_capabilities\"}\r\n")
+        .context("failed to send qmp_capabilities")?;
+    let resp = read_response(&mut reader)?;
+    if let Some(error) = resp.get("error") {
+        bail!("qmp_capabilities failed: {error}");
+    }
+    let mut responses = Vec::new();
+    for command in commands {
+        writer
+            .write_all(command.as_bytes())
+            .and_then(|()| writer.write_all(b"\r\n"))
+            .with_context(|| format!("failed to send QMP command {command}"))?;
+        let resp = read_response(&mut reader)?;
+        if let Some(error) = resp.get("error") {
+            bail!("QMP command {command} failed: {error}");
+        }
+        responses.push(resp);
+    }
+    Ok(responses)
+}
+
+/// Query the QMP runstate (e.g. "prelaunch", "paused", "running").
+pub(crate) fn qmp_query_status(socket: &Path) -> Result<String> {
+    let responses = qmp_execute(socket, &[r#"{"execute":"query-status"}"#])?;
+    let status = responses[0]
+        .get("return")
+        .and_then(|ret| ret.get("status"))
+        .and_then(|status| status.as_str())
+        .context("QMP query-status returned no status")?;
+    Ok(status.to_string())
+}
+
+/// Ask the guest OS to shut down via QMP `system_powerdown` (ACPI).
+pub(crate) fn qmp_system_powerdown(socket: &Path) -> Result<()> {
+    qmp_execute(socket, &[r#"{"execute":"system_powerdown"}"#])?;
+    Ok(())
+}
+
+/// Pause a running guest via QMP `stop`.
+pub(crate) fn qmp_stop(socket: &Path) -> Result<()> {
+    qmp_execute(socket, &[r#"{"execute":"stop"}"#])?;
+    Ok(())
+}
+
+/// Resume a paused guest via QMP `cont`.
+pub(crate) fn qmp_cont(socket: &Path) -> Result<()> {
+    qmp_execute(socket, &[r#"{"execute":"cont"}"#])?;
+    Ok(())
+}
+
+/// Copy a stopped logical VM's encrypted disk into a pool VM's raw placeholder.
+/// The destination inode is already open by paused QEMU, so `-n` is required.
+pub(crate) fn replace_pool_data_disk(source: &Path, destination: &Path) -> Result<()> {
+    let info = Command::new("qemu-img")
+        .args(["info", "--output=json"])
+        .arg(source)
+        .output()
+        .context("Failed to inspect source data disk")?;
+    if !info.status.success() {
+        bail!(
+            "Failed to inspect source data disk: {}",
+            String::from_utf8_lossy(&info.stderr)
+        );
+    }
+    let info: serde_json::Value =
+        serde_json::from_slice(&info.stdout).context("Invalid qemu-img info output")?;
+    let format = info
+        .get("format")
+        .and_then(|value| value.as_str())
+        .context("qemu-img info did not report source format")?;
+    let output = Command::new("qemu-img")
+        .args(["convert", "-n", "-f", format, "-O", "raw"])
+        .arg(source)
+        .arg(destination)
+        .output()
+        .context("Failed to copy data disk into pool placeholder")?;
+    if !output.status.success() {
+        bail!(
+            "Failed to copy data disk into pool placeholder: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -1120,6 +1365,9 @@ mod tests {
                 volumes: vec![VmVolume {
                     source: "/does-not-exist/volume.img".into(),
                 }],
+                paused: false,
+                pool: false,
+                runtime_id: None,
             },
             image: Image {
                 info: ImageInfo {

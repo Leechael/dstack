@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     str::FromStr,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -43,6 +43,7 @@ use safe_write::{safe_write, safe_write_with_mode};
 use scopeguard::defer;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::{
@@ -307,9 +308,19 @@ impl HostShared {
         copy(INSTANCE_INFO, SZ_1KB * 10, true)?;
         copy(ENCRYPTED_ENV, SZ_1KB * 256, true)?;
         copy(USER_CONFIG, SZ_1MB * 50, true)?;
-        info!("Unmounting host-shared");
-        unmount_host_shared(host_shared_dir)?;
+        copy(".pool-claimed", SZ_1KB, true)?;
+        // Claimed pool VMs keep the live 9p mount so mount_data_disk can poll
+        // .pool-disk-ready while the VMM finishes the ciphertext copy.
+        if !host_shared_dir.join(".pool-claimed").exists() {
+            info!("Unmounting host-shared");
+            unmount_host_shared(host_shared_dir)?;
+        }
         HostShared::load(host_shared_copy_dir)
+    }
+
+    fn pool_claimed(&self) -> bool {
+        self.dir.base_dir.join(".pool-claimed").exists()
+            || Path::new("/tmp/.host-shared/.pool-claimed").exists()
     }
 }
 
@@ -2394,6 +2405,55 @@ fn kms_rpc_url(base: &str) -> String {
     }
 }
 
+type TempCaResult = Result<rpc::GetTempCaCertResponse>;
+
+const TEMP_CA_PREFETCH_FILE: &str = "temp-ca-prefetch.json";
+const TEMP_CA_PREFETCH_STARTED_FILE: &str = "temp-ca-prefetch.started";
+
+#[derive(Serialize, Deserialize)]
+struct TempCaPrefetchFile {
+    kms_url: String,
+    response: Option<rpc::GetTempCaCertResponse>,
+    error: Option<String>,
+}
+
+async fn fetch_temp_ca_cert(kms_url: &str, url_index: usize) -> TempCaResult {
+    let build_start = Instant::now();
+    let client = RaClientConfig::builder()
+        .remote_uri(kms_url.to_string())
+        .tls_no_check(true)
+        .tls_built_in_root_certs(false)
+        .build()
+        .into_client()
+        .context("failed to create client")?;
+    info!(
+        "KMS_TIMING2 stage=temp_ca_client_build url_index={} elapsed_ms={}",
+        url_index,
+        build_start.elapsed().as_millis()
+    );
+    let conn_start = Instant::now();
+    match client.warmup_connection().await {
+        Ok(()) => info!(
+            "KMS_TIMING2 stage=temp_ca_conn_setup url_index={} elapsed_ms={}",
+            url_index,
+            conn_start.elapsed().as_millis()
+        ),
+        Err(err) => warn!("Failed to warm up temp ca connection to {kms_url}: {err:#}"),
+    }
+    let rpc_start = Instant::now();
+    let kms_client = dstack_kms_rpc::kms_client::KmsClient::new(client);
+    let response = kms_client
+        .get_temp_ca_cert()
+        .await
+        .context("Failed to get temp ca cert")?;
+    info!(
+        "KMS_TIMING2 stage=temp_ca_rpc url_index={} elapsed_ms={}",
+        url_index,
+        rpc_start.elapsed().as_millis()
+    );
+    Ok(response)
+}
+
 impl<'a> Stage0<'a> {
     fn host_api(&self) -> HostApi {
         HostApi::new(
@@ -2427,18 +2487,106 @@ impl<'a> Stage0<'a> {
         self.shared.dir.join(APP_KEYS)
     }
 
-    async fn request_app_keys_from_kms_url(&self, kms_url: String) -> Result<AppKeys> {
+    /// Use the temp CA cert prefetched by dstack-prepare.sh when it matches
+    /// the KMS URL being requested.
+    async fn take_prefetched_temp_ca(&self, kms_url: &str) -> Option<rpc::GetTempCaCertResponse> {
+        let path = self.args.work_dir.join(TEMP_CA_PREFETCH_FILE);
+        let started_path = self.args.work_dir.join(TEMP_CA_PREFETCH_STARTED_FILE);
+        let mut content = fs::read(&path).ok();
+        if content.is_none() && started_path.exists() {
+            for _ in 0..50 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                if let Ok(data) = fs::read(&path) {
+                    content = Some(data);
+                    break;
+                }
+            }
+        }
+        let content = content?;
+        let prefetched: TempCaPrefetchFile = serde_json::from_slice(&content)
+            .map_err(|err| warn!("Ignoring invalid temp ca prefetch file: {err:#}"))
+            .ok()?;
+        let _ = fs::remove_file(&started_path);
+        if let Some(error) = prefetched.error {
+            warn!("Temp ca prefetch failed in background: {error}");
+            let _ = fs::remove_file(&path);
+            return None;
+        }
+        let response = prefetched.response?;
+        if prefetched.kms_url != kms_url {
+            warn!("Temp ca prefetch URL mismatch, fetching inline");
+            return None;
+        }
+        let _ = fs::remove_file(&path);
+        info!("KMS_TIMING2 stage=temp_ca_prefetch_hit elapsed_ms=0");
+        Some(response)
+    }
+
+    /// Fetch temp CA certs for all configured KMS URLs in the background.
+    /// Runs on a dedicated OS thread so a single-vCPU guest still makes
+    /// progress while the main task does blocking setup.
+    fn spawn_temp_ca_prefetch(&self) -> mpsc::Receiver<TempCaResult> {
+        let kms_urls: Vec<String> = self
+            .shared
+            .sys_config
+            .kms_urls
+            .iter()
+            .map(|url| kms_rpc_url(url))
+            .collect();
+        let (tx, rx) = mpsc::channel(kms_urls.len().max(1));
+        std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                warn!("failed to build temp ca prefetch runtime");
+                return;
+            };
+            rt.block_on(async move {
+                for (url_index, kms_url) in kms_urls.into_iter().enumerate() {
+                    let result = fetch_temp_ca_cert(&kms_url, url_index).await;
+                    if tx.send(result).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        });
+        rx
+    }
+
+    async fn request_app_keys_from_kms_url(
+        &self,
+        kms_url: String,
+        mut temp_ca_rx: Option<&mut mpsc::Receiver<TempCaResult>>,
+    ) -> Result<AppKeys> {
         info!("Requesting app keys from KMS: {kms_url}");
+        let kms_timing_start = Instant::now();
         let tmp_ca = {
             info!("Getting temp ca cert");
-            let client = RaClient::new(kms_url.clone(), true)?;
-            let kms_client = dstack_kms_rpc::kms_client::KmsClient::new(client);
-            kms_client
-                .get_temp_ca_cert()
-                .await
-                .context("Failed to get temp ca cert")?
+            match self.take_prefetched_temp_ca(&kms_url).await {
+                Some(response) => response,
+                None => match temp_ca_rx.as_mut() {
+                    Some(rx) => match rx.recv().await {
+                        Some(result) => result?,
+                        None => {
+                            warn!("Temp ca prefetch channel closed, fetching inline");
+                            fetch_temp_ca_cert(&kms_url, 0).await?
+                        }
+                    },
+                    None => fetch_temp_ca_cert(&kms_url, 0).await?,
+                },
+            }
         };
+        info!(
+            "KMS_TIMING stage=temp_ca_cert elapsed_ms={}",
+            kms_timing_start.elapsed().as_millis()
+        );
+        let ra_cert_start = Instant::now();
         let cert_pair = generate_ra_cert(tmp_ca.temp_ca_cert.clone(), tmp_ca.temp_ca_key.clone())?;
+        info!(
+            "KMS_TIMING stage=ra_cert_gen elapsed_ms={}",
+            ra_cert_start.elapsed().as_millis()
+        );
         let attestation_verifier = attestation_verifier(&self.shared.sys_config)?;
         let ra_client = RaClientConfig::builder()
             .tls_no_check(false)
@@ -2452,7 +2600,16 @@ impl<'a> Stage0<'a> {
             .build()
             .into_client()
             .context("Failed to create client")?;
+        let handshake_start = Instant::now();
+        match ra_client.warmup_connection().await {
+            Ok(()) => info!(
+                "KMS_TIMING2 stage=tls_handshake elapsed_ms={}",
+                handshake_start.elapsed().as_millis()
+            ),
+            Err(err) => warn!("Failed to warm up KMS mtls connection: {err:#}"),
+        }
         let kms_client = dstack_kms_rpc::kms_client::KmsClient::new(ra_client);
+        let get_app_key_start = Instant::now();
         let response = kms_client
             .get_app_key(rpc::GetAppKeyRequest {
                 api_version: 1,
@@ -2460,7 +2617,12 @@ impl<'a> Stage0<'a> {
             })
             .await
             .context("Failed to get app key")?;
+        info!(
+            "KMS_TIMING stage=ra_tls_get_app_key elapsed_ms={}",
+            get_app_key_start.elapsed().as_millis()
+        );
 
+        let verify_start = Instant::now();
         emit_runtime_event("os-image-hash", &response.os_image_hash)
             .context("failed to extend os-image-hash to the launch measurement")?;
 
@@ -2468,6 +2630,14 @@ impl<'a> Stage0<'a> {
             .context("Failed to parse ca cert")?;
         let x509 = ca_pem.parse_x509().context("Failed to parse ca cert")?;
         let root_pubkey = x509.public_key().raw.to_vec();
+        info!(
+            "KMS_TIMING stage=response_verify elapsed_ms={}",
+            verify_start.elapsed().as_millis()
+        );
+        info!(
+            "KMS_TIMING stage=total elapsed_ms={}",
+            kms_timing_start.elapsed().as_millis()
+        );
 
         let keys = AppKeys {
             ca_cert: tmp_ca.ca_cert,
@@ -2490,11 +2660,14 @@ impl<'a> Stage0<'a> {
         if self.shared.sys_config.kms_urls.is_empty() {
             bail!("No KMS URLs are set");
         }
+        let mut temp_ca_rx = self.spawn_temp_ca_prefetch();
         let keys = 'out: {
             let mut error = anyhow!("unknown error");
             for (i, kms_url) in self.shared.sys_config.kms_urls.iter().enumerate() {
                 let kms_url = kms_rpc_url(kms_url);
-                let response = self.request_app_keys_from_kms_url(kms_url.clone()).await;
+                let response = self
+                    .request_app_keys_from_kms_url(kms_url.clone(), Some(&mut temp_ca_rx))
+                    .await;
                 match response {
                     Ok(response) => {
                         break 'out response;
@@ -2609,12 +2782,33 @@ impl<'a> Stage0<'a> {
 
     async fn setup_swapfile(&self, swap_size: u64) -> Result<()> {
         let swapfile = self.args.mount_point.join("swapfile");
+        if swap_size == 0 {
+            if swapfile.exists() {
+                fs::remove_file(&swapfile).context("Failed to remove swapfile")?;
+                info!("Removed existing swapfile");
+            }
+            return Ok(());
+        }
         if swapfile.exists() {
+            let existing_size = swapfile
+                .metadata()
+                .context("Failed to stat existing swapfile")?
+                .len();
+            if existing_size == swap_size {
+                info!(
+                    "Reusing existing swapfile at {} ({existing_size} bytes)",
+                    swapfile.display()
+                );
+                let swapfile = swapfile.display().to_string();
+                cmd! {
+                    swapon $swapfile;
+                    swapon --show;
+                }
+                .context("Failed to enable existing swapfile")?;
+                return Ok(());
+            }
             fs::remove_file(&swapfile).context("Failed to remove swapfile")?;
             info!("Removed existing swapfile");
-        }
-        if swap_size == 0 {
-            return Ok(());
         }
         let swapfile = swapfile.display().to_string();
         info!("Creating swapfile at {swapfile} (size {swap_size} bytes)");
@@ -2739,7 +2933,22 @@ impl<'a> Stage0<'a> {
         initialized
     }
 
+    async fn wait_pool_disk_ready(&self) -> Result<()> {
+        if !self.shared.pool_claimed() {
+            return Ok(());
+        }
+        let flag = Path::new("/tmp/.host-shared/.pool-disk-ready");
+        for _ in 0..1500 {
+            if flag.exists() {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        bail!("timed out waiting for pool data disk copy");
+    }
+
     async fn mount_data_disk(&self, disk_crypt_key: &str, opts: &DstackOptions) -> Result<()> {
+        self.wait_pool_disk_ready().await?;
         let name = "dstack_data_disk";
         let mount_point = &self.args.mount_point;
 
@@ -2778,7 +2987,7 @@ impl<'a> Stage0<'a> {
                 FsType::Ext4 => {
                     info!("Creating ext4 filesystem");
                     cmd! {
-                        mkfs.ext4 -F $fs_dev;
+                        mkfs.ext4 -F -K -E lazy_itable_init=1,lazy_journal_init=1 $fs_dev;
                         mount $fs_dev $mount_point;
                     }
                     .context("Failed to create ext4 filesystem")?;
@@ -2821,6 +3030,15 @@ impl<'a> Stage0<'a> {
         let dev = dev.as_ref();
         let mount_point = mount_point.as_ref();
         info!("Checking filesystem");
+
+        if Path::new("/tmp/.host-shared/.pool-claimed").exists() {
+            info!("Skipping e2fsck on claimed pool volume");
+            cmd! {
+                mount $dev $mount_point;
+            }
+            .context("Failed to mount claimed ext4 filesystem")?;
+            return Ok(());
+        }
 
         let e2fsck_status = Command::new("e2fsck")
             .arg("-f")
@@ -2871,6 +3089,8 @@ impl<'a> Stage0<'a> {
                 "aes-xts-plain64",
                 "--pbkdf",
                 "pbkdf2",
+                "--pbkdf-force-iterations",
+                "1000",
                 "-d-",
             ])
             .arg(root_hd)

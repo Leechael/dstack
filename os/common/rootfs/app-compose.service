@@ -1,7 +1,6 @@
 [Unit]
 Description=App Compose Service
-Wants=docker.service containerd.service containerd-stargz-grpc.service
-After=docker.service containerd.service containerd-stargz-grpc.service dstack-prepare.service dstack-guest-agent.service
+After=dstack-prepare.service dstack-guest-agent.service
 
 [Service]
 Type=oneshot
