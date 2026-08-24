@@ -526,11 +526,15 @@ impl App {
             let Some(target) = state.get(id).cloned() else {
                 bail!("VM not found");
             };
-            if target.config.manifest.pool
-                || VmWorkDir::new(&target.config.workdir)
-                    .started()
-                    .unwrap_or(false)
+            if target.config.manifest.pool {
+                warn!(id, "skip pool claim: target is itself a pool member");
+                return Ok(false);
+            }
+            if VmWorkDir::new(&target.config.workdir)
+                .started()
+                .unwrap_or(false)
             {
+                warn!(id, "skip pool claim: target is still marked started");
                 return Ok(false);
             }
             let candidates = state
@@ -552,9 +556,11 @@ impl App {
             .await?
             .is_some_and(|info| info.state.status.is_running())
         {
+            warn!(id, "skip pool claim: target QEMU is still running");
             return Ok(false);
         }
         if !target.config.workdir.join("hda.img").exists() {
+            warn!(id, "skip pool claim: target has no hda.img");
             return Ok(false);
         }
 
@@ -584,6 +590,11 @@ impl App {
             }
         }
         let Some(pool) = selected else {
+            warn!(
+                id,
+                candidates = candidates.len(),
+                "skip pool claim: no paused pool member"
+            );
             return Ok(false);
         };
 
@@ -960,6 +971,15 @@ impl App {
             .info(&runtime_id)
             .await?
             .is_some_and(|info| info.state.status.is_running());
+        if running {
+            if let Ok(client) = self.guest_agent_client(id) {
+                match tokio::time::timeout(Duration::from_secs(2), client.shutdown()).await {
+                    Ok(Ok(())) => info!("asked guest-agent to power off {id}"),
+                    Ok(Err(err)) => warn!("guest-agent shutdown for {id} failed: {err:?}"),
+                    Err(_) => warn!("guest-agent shutdown for {id} timed out"),
+                }
+            }
+        }
         if running && qmp_socket.exists() {
             let socket = qmp_socket.clone();
             let powered_down = tokio::task::spawn_blocking(move || {
@@ -969,7 +989,7 @@ impl App {
             .map(|r| r.is_ok())
             .unwrap_or(false);
             if powered_down {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
                 loop {
                     let still_running = self
                         .supervisor
