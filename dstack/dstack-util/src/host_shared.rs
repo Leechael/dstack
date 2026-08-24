@@ -68,11 +68,9 @@ pub fn mount_host_shared(mount_point: &Path) -> Result<()> {
     fs::create_dir_all(mount_point)
         .with_context(|| format!("failed to create {}", mount_point.display()))?;
     if already_mounted(mount_point) {
-        info!(
-            mount_point = %mount_point.display(),
-            "host-shared already mounted"
-        );
-        return Ok(());
+        // prepare.sh may have mounted 9p earlier. Remount so later claim
+        // flags (.pool-standby, .pool-release) are not hidden by 9p dcache.
+        let _ = Command::new("umount").arg(mount_point).status();
     }
 
     if let Some(device) = find_disk_by_label(HOST_SHARED_DISK_LABEL) {
@@ -101,7 +99,7 @@ pub fn mount_host_shared(mount_point: &Path) -> Result<()> {
             "-t",
             "9p",
             "-o",
-            "trans=virtio,version=9p2000.L,ro",
+            "trans=virtio,version=9p2000.L,ro,cache=none",
             "host-shared",
         ])
         .arg(mount_point)

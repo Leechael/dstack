@@ -98,7 +98,7 @@ mount_overlay /home "$OVERLAY_TMP"
 # overlap time sync and disk setup. Pooled CVMs wait here until the VMM
 # writes the real config and .pool-release.
 mkdir -p /tmp/.host-shared
-if mount -t 9p -o trans=virtio,version=9p2000.L,ro host-shared /tmp/.host-shared 2>/dev/null; then
+if mount -t 9p -o trans=virtio,version=9p2000.L,ro,cache=none host-shared /tmp/.host-shared 2>/dev/null; then
 	PCCS_WARM_URL=$(jq -r '.pccs_url // empty' /tmp/.host-shared/.sys-config.json 2>/dev/null || true)
 	if [ ! -e /tmp/.host-shared/.pool-release ]; then
 		log "pool barrier: .pool-release missing, waiting for claim"

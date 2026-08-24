@@ -22,7 +22,21 @@ struct LocalMrConfigValues<'a> {
     key_provider_id: &'a [u8],
 }
 
+/// TDINFO starts at offset 512 in TDREPORT; MRCONFIGID is 64 bytes into TDINFO.
+const TDREPORT_MRCONFIGID_OFF: usize = 512 + 8 + 8 + 48;
+
+fn mr_config_id_from_tdreport(report: &[u8; 1024]) -> [u8; 48] {
+    let mut id = [0u8; 48];
+    id.copy_from_slice(&report[TDREPORT_MRCONFIGID_OFF..TDREPORT_MRCONFIGID_OFF + 48]);
+    id
+}
+
 fn read_mr_config_id() -> Result<[u8; 48]> {
+    // Local TDREPORT is enough to read MRCONFIGID. A full quote talks to QGS
+    // and costs ~1s on the 0.6.0 TSM path.
+    if let Ok(report) = tdx_attest::get_report(&[0u8; 64]) {
+        return Ok(mr_config_id_from_tdreport(&report.0));
+    }
     let quote = tdx_attest::get_quote(&[0u8; 64]).context("Failed to get quote")?;
     let quote = dcap_qvl::quote::Quote::parse(&quote).context("Failed to parse quote")?;
     let configid = quote
@@ -203,6 +217,16 @@ fn verify_mr_config_v3_document(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tdreport_mr_config_id_offset_matches_tdinfo_layout() {
+        let mut report = [0u8; 1024];
+        report[TDREPORT_MRCONFIGID_OFF] = 0xab;
+        report[TDREPORT_MRCONFIGID_OFF + 47] = 0xcd;
+        let id = mr_config_id_from_tdreport(&report);
+        assert_eq!(id[0], 0xab);
+        assert_eq!(id[47], 0xcd);
+    }
 
     #[test]
     fn tdx_mr_config_id_v1_accepts_expected_value() {
