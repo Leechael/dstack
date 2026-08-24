@@ -115,6 +115,16 @@ validate_runner
 
 case "$ACTION" in
 start)
+    case "$runner" in
+    docker-compose|nerdctl-compose)
+        echo "Starting container runtimes"
+        if ! systemctl start sysbox.service docker.service containerd.service containerd-stargz-grpc.service; then
+            dstack-util notify-host -e "boot.error" -d "failed to start container runtimes"
+            exit 1
+        fi
+        ;;
+    esac
+
     if [ "$(jq 'has("pre_launch_script")' "$APP_COMPOSE_FILE")" = true ]; then
         echo "Running pre-launch script"
         dstack-util notify-host -e "boot.progress" -d "pre-launch" || true
