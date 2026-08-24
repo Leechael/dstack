@@ -307,9 +307,19 @@ impl HostShared {
         copy(INSTANCE_INFO, SZ_1KB * 10, true)?;
         copy(ENCRYPTED_ENV, SZ_1KB * 256, true)?;
         copy(USER_CONFIG, SZ_1MB * 50, true)?;
-        info!("Unmounting host-shared");
-        unmount_host_shared(host_shared_dir)?;
+        copy(".pool-claimed", SZ_1KB, true)?;
+        // Claimed pool VMs keep the live 9p mount so mount_data_disk can poll
+        // .pool-disk-ready while the VMM finishes the ciphertext copy.
+        if !host_shared_dir.join(".pool-claimed").exists() {
+            info!("Unmounting host-shared");
+            unmount_host_shared(host_shared_dir)?;
+        }
         HostShared::load(host_shared_copy_dir)
+    }
+
+    fn pool_claimed(&self) -> bool {
+        self.dir.base_dir.join(".pool-claimed").exists()
+            || Path::new("/tmp/.host-shared/.pool-claimed").exists()
     }
 }
 
@@ -2622,7 +2632,10 @@ impl<'a> Stage0<'a> {
                 .context("Failed to stat existing swapfile")?
                 .len();
             if existing_size == swap_size {
-                info!("Reusing existing swapfile at {} ({existing_size} bytes)", swapfile.display());
+                info!(
+                    "Reusing existing swapfile at {} ({existing_size} bytes)",
+                    swapfile.display()
+                );
                 let swapfile = swapfile.display().to_string();
                 cmd! {
                     swapon $swapfile;
@@ -2757,7 +2770,22 @@ impl<'a> Stage0<'a> {
         initialized
     }
 
+    async fn wait_pool_disk_ready(&self) -> Result<()> {
+        if !self.shared.pool_claimed() {
+            return Ok(());
+        }
+        let flag = Path::new("/tmp/.host-shared/.pool-disk-ready");
+        for _ in 0..1500 {
+            if flag.exists() {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        bail!("timed out waiting for pool data disk copy");
+    }
+
     async fn mount_data_disk(&self, disk_crypt_key: &str, opts: &DstackOptions) -> Result<()> {
+        self.wait_pool_disk_ready().await?;
         let name = "dstack_data_disk";
         let mount_point = &self.args.mount_point;
 
@@ -2839,6 +2867,15 @@ impl<'a> Stage0<'a> {
         let dev = dev.as_ref();
         let mount_point = mount_point.as_ref();
         info!("Checking filesystem");
+
+        if Path::new("/tmp/.host-shared/.pool-claimed").exists() {
+            info!("Skipping e2fsck on claimed pool volume");
+            cmd! {
+                mount $dev $mount_point;
+            }
+            .context("Failed to mount claimed ext4 filesystem")?;
+            return Ok(());
+        }
 
         let e2fsck_status = Command::new("e2fsck")
             .arg("-f")

@@ -132,6 +132,23 @@ start)
         source <(jq -r '.pre_launch_script' "$APP_COMPOSE_FILE")
     fi
 
+    # Pool standby barrier: a pre-bound standby runs everything up to here
+    # (keys, disk, env, container runtimes, pre-launch), then holds until the
+    # user's StartVm releases the app.
+    if [ -e /tmp/.host-shared/.pool-standby ] && [ ! -e /tmp/.host-shared/.pool-app-release ]; then
+        echo "pool app barrier: standby ready, waiting for start"
+        dstack-util notify-host -e "boot.progress" -d "pool standby" || true
+        APP_WAIT=0
+        while [ ! -e /tmp/.host-shared/.pool-app-release ]; do
+            if [ "$APP_WAIT" -ge 15000 ]; then
+                echo "pool app barrier: timeout, continuing"
+                break
+            fi
+            sleep 0.02
+            APP_WAIT=$((APP_WAIT + 1))
+        done
+    fi
+
     case "$runner" in
     docker-compose|nerdctl-compose)
         echo "Starting containers with runner=$runner snapshotter=$snapshotter"

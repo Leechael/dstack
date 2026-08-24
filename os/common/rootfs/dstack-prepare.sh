@@ -94,6 +94,38 @@ mount_overlay /usr "$OVERLAY_TMP"
 mount_overlay /bin "$OVERLAY_TMP"
 mount_overlay /home "$OVERLAY_TMP"
 
+# Prefetch the KMS temp CA and warm PCCS in the background so those RTTs
+# overlap time sync and disk setup. Pooled CVMs wait here until the VMM
+# writes the real config and .pool-release.
+mkdir -p /tmp/.host-shared
+if mount -t 9p -o trans=virtio,version=9p2000.L,ro host-shared /tmp/.host-shared 2>/dev/null; then
+	PCCS_WARM_URL=$(jq -r '.pccs_url // empty' /tmp/.host-shared/.sys-config.json 2>/dev/null || true)
+	if [ ! -e /tmp/.host-shared/.pool-release ]; then
+		log "pool barrier: .pool-release missing, waiting for claim"
+		dstack-util notify-host -e "boot.progress" -d "pool barrier" || true
+		POOL_WAIT=0
+		while [ ! -e /tmp/.host-shared/.pool-release ]; do
+			if [ "$POOL_WAIT" -ge 6000 ]; then
+				log "pool barrier: timeout, continuing"
+				break
+			fi
+			sleep 0.02
+			POOL_WAIT=$((POOL_WAIT + 1))
+		done
+	fi
+	if [ -n "$PCCS_WARM_URL" ]; then
+		(
+			for path in \
+				"/sgx/certification/v4/root-cacrl" \
+				"/sgx/certification/v4/pckcrl?ca=processor&encoding=der" \
+				"/sgx/certification/v4/qe/identity" \
+				"/sgx/certification/v4/tcb?fmspc=B0C06F000000"; do
+				curl -fsS --max-time 2 "${PCCS_WARM_URL}${path}" >/dev/null 2>&1 || true
+			done
+		) &
+	fi
+fi
+
 # Make sure the system time is synchronized
 log "Syncing system time..."
 # Let the chronyd correct the system time immediately; keep booting if chronyd is not ready yet.
