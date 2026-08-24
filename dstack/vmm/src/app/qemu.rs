@@ -164,7 +164,76 @@ fn create_hd(
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    if let Err(err) = write_data_gpt(image_file.as_ref()) {
+        tracing::warn!(
+            "failed to pre-create GPT on {}: {err:#}; guest will partition the disk on first boot",
+            image_file.as_ref().display()
+        );
+    }
     Ok(())
+}
+
+/// Best-effort: write a GPT with a single `dstack-data` partition (1MiB to end
+/// of disk, type 8300) into a freshly created qcow2 data disk, mirroring the
+/// guest-side `create_data_partition` so the guest can skip partitioning on
+/// first boot. Failures are logged by the caller; the guest fallback remains.
+fn write_data_gpt(image_file: &Path) -> Result<()> {
+    which::which("qemu-nbd").context("qemu-nbd not found")?;
+    which::which("sgdisk").context("sgdisk not found")?;
+    let _ = Command::new("sudo")
+        .args(["-n", "modprobe", "nbd"])
+        .output();
+    let nbd_name = (0..16)
+        .map(|i| format!("nbd{i}"))
+        .find(|name| {
+            fs::read_to_string(format!("/sys/block/{name}/pid"))
+                .map(|pid| pid.trim().is_empty())
+                .unwrap_or(true)
+        })
+        .context("no free nbd device found")?;
+    let nbd_path = format!("/dev/{nbd_name}");
+    let image = image_file.display().to_string();
+    let run = |args: &[&str]| -> Result<()> {
+        let output = Command::new("sudo")
+            .arg("-n")
+            .args(args)
+            .output()
+            .with_context(|| format!("failed to run: {}", args.join(" ")))?;
+        if !output.status.success() {
+            bail!(
+                "`{}` failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
+    };
+    run(&[
+        "qemu-nbd",
+        "--connect",
+        &nbd_path,
+        "--format",
+        "qcow2",
+        &image,
+    ])?;
+    let result = (|| -> Result<()> {
+        run(&["sgdisk", "-Z", &nbd_path])?;
+        run(&[
+            "sgdisk",
+            "-n",
+            "1:1MiB:0",
+            "-c",
+            "1:dstack-data",
+            "-t",
+            "1:8300",
+            &nbd_path,
+        ])?;
+        Ok(())
+    })();
+    let _ = Command::new("sudo")
+        .args(["-n", "qemu-nbd", "--disconnect", &nbd_path])
+        .output();
+    result
 }
 
 fn virtio_pci_device(device: &str, snp: bool) -> String {
