@@ -2535,10 +2535,13 @@ impl<'a> Stage0<'a> {
             .collect();
         let (tx, rx) = mpsc::channel(kms_urls.len().max(1));
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .expect("failed to build temp ca prefetch runtime");
+            else {
+                warn!("failed to build temp ca prefetch runtime");
+                return;
+            };
             rt.block_on(async move {
                 for (url_index, kms_url) in kms_urls.into_iter().enumerate() {
                     let result = fetch_temp_ca_cert(&kms_url, url_index).await;
