@@ -787,8 +787,10 @@ impl QemuCommandBuilder<'_> {
             command.arg("-device").arg(format!(
                 "pcie-root-port,id=pci.{device_number},bus={bus},chassis={device_number}",
             ));
+            // The id makes the device addressable by `device_del`, which the
+            // stop path uses to hand the card back before the TD teardown.
             command.arg("-device").arg(format!(
-                "vfio-pci,host={slot},bus=pci.{device_number},iommufd=iommufd0",
+                "vfio-pci,host={slot},id=vfio_gpu{device_number},bus=pci.{device_number},iommufd=iommufd0",
             ));
             device_number += 1;
         }
@@ -798,7 +800,7 @@ impl QemuCommandBuilder<'_> {
                 "pcie-root-port,id=pci.{device_number},bus=pcie.0,chassis={device_number}",
             ));
             command.arg("-device").arg(format!(
-                "vfio-pci,host={slot},bus=pci.{device_number},iommufd=iommufd0",
+                "vfio-pci,host={slot},id=vfio_bridge{device_number},bus=pci.{device_number},iommufd=iommufd0",
             ));
             device_number += 1;
         }
