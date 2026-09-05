@@ -65,6 +65,8 @@ enum Command {
     CheckConfig,
     /// One-shot VM execution mode for debugging
     Run(RunArgs),
+    /// Hot-unplug a running VM's vfio-pci devices over QMP (debugging/ops)
+    DetachVfio(DetachVfioArgs),
     /// Run the privileged TAP and libvirt nwfilter broker.
     Netd(NetdArgs),
     /// Internal per-VM QEMU/swtpm launcher.
@@ -89,6 +91,16 @@ struct RunArgs {
     /// Dry run: only output QEMU command without executing
     #[arg(long)]
     dry_run: bool,
+}
+
+#[derive(ClapArgs)]
+struct DetachVfioArgs {
+    /// Path to the VM's QMP socket, e.g. <run_path>/<vm-id>/qmp.sock
+    #[arg(long)]
+    socket: String,
+    /// Maximum time in milliseconds to wait for the guest to release the devices
+    #[arg(long, default_value_t = 20_000)]
+    timeout_ms: u64,
 }
 
 #[derive(ClapArgs)]
@@ -208,6 +220,20 @@ async fn main() -> Result<()> {
         return vm_launcher::run(Path::new(&launcher_args.spec)).await;
     }
 
+    // Needs no server configuration; only the VM's QMP socket. Exposed
+    // separately from the stop path so the unplug can be triggered against a
+    // healthy, idle guest -- a guest already in ACPI shutdown may never
+    // answer the eject request.
+    if let Some(Command::DetachVfio(detach_args)) = &args.command {
+        let count = app::qmp::detach_vfio_devices(
+            Path::new(&detach_args.socket),
+            Duration::from_millis(detach_args.timeout_ms),
+        )
+        .await?;
+        println!("detached {count} vfio device(s)");
+        return Ok(());
+    }
+
     let figment = config::load_config_figment(args.config.as_deref());
     if let Some(Command::Netd(netd_args)) = &args.command {
         let mut netd_config: NetdConfig = figment
@@ -243,6 +269,7 @@ async fn main() -> Result<()> {
     // Handle commands
     match args.command.unwrap_or_default() {
         Command::VmLauncher(_) => unreachable!("launcher mode handled before config loading"),
+        Command::DetachVfio(_) => unreachable!("detach-vfio handled before config loading"),
         Command::CheckConfig => {
             config.validate()?;
             let _: rocket::listener::Endpoint = figment
