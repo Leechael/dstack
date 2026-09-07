@@ -53,6 +53,7 @@ mod image;
 mod mr_config;
 mod network;
 mod qemu;
+pub(crate) mod qmp;
 pub(crate) mod registry;
 mod vm_info;
 mod workdir;
@@ -671,10 +672,36 @@ impl App {
         Ok(())
     }
 
+    /// Ask QEMU to hot-unplug the vfio-pci devices before the guest dies.
+    ///
+    /// The private memory reclaim of a dying TD serialises the implicit
+    /// release that happens at process exit, so the cards stay busy for
+    /// minutes after QEMU is gone. Detaching first returns them while the
+    /// reclaim runs. Purely best-effort: without a QMP socket, or if the guest
+    /// declines the ACPI eject, we fall through to the ordinary shutdown.
+    async fn detach_vfio_devices(&self, id: &str) {
+        let Ok(work_dir) = self.work_dir(id) else {
+            return;
+        };
+        let socket = work_dir.qmp_socket();
+        if !socket.exists() {
+            return;
+        }
+        let budget = std::time::Duration::from_secs(20);
+        match qmp::detach_vfio_devices(&socket, budget).await {
+            Ok(0) => {}
+            Ok(count) => info!(id, count, "detached vfio devices before shutdown"),
+            Err(error) => warn!(id, %error, "vfio hot-unplug failed; falling back to plain stop"),
+        }
+    }
+
     pub(crate) async fn stop_vm_process(&self, id: &str) -> Result<()> {
         let Some(info) = self.supervisor.info(id).await? else {
             return Ok(());
         };
+        if info.state.status.is_running() {
+            self.detach_vfio_devices(id).await;
+        }
         // Non-TPM VMs run QEMU directly and keep the existing Supervisor stop
         // path. Only the TPM launcher's hidden subcommand implements graceful
         // child-process shutdown.
